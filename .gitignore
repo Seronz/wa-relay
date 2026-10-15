@@ -1,0 +1,5 @@
+state/
+relay.log
+sync.log
+*.pid
+__pycache__/
