@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop relay + wacli sync milik proyek ini (via pidfile, fallback pkill).
+# Stop relay + wacli sync milik proyek ini (lewat pidfile, fallback pkill).
 set -uo pipefail
 cd "$(dirname "$0")"
 
@@ -12,9 +12,9 @@ stop_pidfile() {
   fi
 }
 
-stop_pidfile relay.pid relay
+stop_pidfile relay.pid "wa-relay"
 stop_pidfile sync.pid "wacli sync"
 
-pkill -f "python3 relay.py" 2>/dev/null || true
+pkill -x wa-relay 2>/dev/null || true
 pkill -f "wacli sync --follow" 2>/dev/null || true
 echo "done"

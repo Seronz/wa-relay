@@ -1,6 +1,6 @@
 # wa-relay
 
-Jembatan lokal: pesan WhatsApp (hanya dari owner) → webhook HTTP lokal → `opencode run` → balasan dikirim balik ke WhatsApp via `wacli send text`.
+Jembatan lokal: pesan WhatsApp (hanya dari owner) → webhook HTTP lokal → `opencode run` → balasan dikirim balik ke WhatsApp via `wacli send text`. Ditulis dalam **Go** (single binary, tanpa dependensi runtime).
 
 ## Cara kerja (alur)
 
@@ -8,11 +8,11 @@ Jembatan lokal: pesan WhatsApp (hanya dari owner) → webhook HTTP lokal → `op
 Owner kirim pesan WhatsApp
         │
         ▼
-wacli sync --follow  ──webhook──►  relay.py  (127.0.0.1:8791/hook)
+wacli sync --follow  ──webhook──►  wa-relay (Go)  (127.0.0.1:8791/hook)
                                       │  verifikasi HMAC, filter owner,
                                       │  dedupe ID, respon 200 segera
                                       ▼
-                                  antrean (queue) ──1 worker thread──►
+                                  antrean (queue) ──1 worker goroutine──►
                                       │
                                       ▼
                               opencode run --format json
@@ -30,7 +30,7 @@ Pesan `ping` (case-insensitive) dibalas `pong` langsung tanpa memanggil agent.
 - Payload pesan (flat JSON, tanpa field `EventType`):
 
 ```json
-{"Chat":"62812xxxxxxx@s.whatsapp.net","ID":"3EB0...","SenderJID":"62812xxxxxxx@s.whatsapp.net","Timestamp":"2026-10-15T10:00:00Z","FromMe":false,"Text":"hi","ChatName":"Irza"}
+{"Chat":"62812xxxxxxx@s.whatsapp.net","ID":"3EB0...","SenderJID":"62812xxxxxxx@s.whatsapp.net","Timestamp":"2026-10-15T10:00:00Z","FromMe":false,"Text":"hi","ChatName":"Owner"}
 ```
 
 - `Media`: objek atau `null`.
@@ -50,11 +50,13 @@ Pesan `ping` (case-insensitive) dibalas `pong` langsung tanpa memanggil agent.
 
 `opencode.json` berisi permission untuk agent yang di-spawn relay: allow read/edit/glob/grep/list, `external_directory` allow-all, bash allow-all tapi **last-match-wins deny** untuk `rm -rf *`, `sudo *`, `git push *`. Longgarkan/ketatkan sesuai kebutuhan.
 
-## Pemakaian
+## Build & pemakaian
 
 ```bash
-./start.sh    # idempotent: restart sync + relay, baca secret dari config.json
-./stop.sh     # stop keduanya (pidfile + fallback pkill)
+go build -o wa-relay .   # atau langsung ./start.sh (auto-build kalau binary belum ada)
+./start.sh               # idempotent: restart sync + relay, baca secret dari config.json
+./stop.sh                # stop keduanya (pidfile + fallback pkill)
+go test ./...            # jalankan test
 ```
 
 Log: `relay.log` (relay) dan `sync.log` (wacli sync). Health check: `curl http://127.0.0.1:8791/health` → `{"ok":true}`.

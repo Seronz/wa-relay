@@ -1,5 +1,6 @@
+config.json
+wa-relay
 state/
 relay.log
 sync.log
 *.pid
-__pycache__/

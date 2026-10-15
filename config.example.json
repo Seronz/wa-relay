@@ -1,0 +1,12 @@
+{
+  "host": "127.0.0.1",
+  "port": 8791,
+  "webhook_secret": "CHANGE_ME_ganti_dengan_token_hex_32_byte",
+  "owner_jid": "62xxxxxxxxxx@s.whatsapp.net",
+  "owner_phone": "62812xxxxxxx",
+  "workdir": "/home/zakaria/projects/wa-relay",
+  "opencode_bin": "opencode",
+  "wacli_bin": "wacli",
+  "timeout_seconds": 480,
+  "log_file": "/home/zakaria/projects/wa-relay/relay.log"
+}
