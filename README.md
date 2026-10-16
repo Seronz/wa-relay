@@ -44,6 +44,7 @@ Pesan `ping` (case-insensitive) dibalas `pong` langsung tanpa memanggil agent.
 | `webhook_secret` | Secret HMAC untuk verifikasi signature |
 | `owner_jid` / `owner_phone` | JID & nomor owner (satu-satunya pengirim yang diproses) |
 | `workdir` | `--dir` untuk `opencode run` |
+| `agent` | Nama agent opencode yang menjawab (`--agent`, default `stepi`) |
 | `opencode_bin` / `wacli_bin` | Path binary |
 | `timeout_seconds` | Timeout `opencode run` (default 480) |
 | `log_file` | Log file relay |

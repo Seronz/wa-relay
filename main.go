@@ -43,7 +43,7 @@ func main() {
 		log:    log,
 		seen:   seen,
 		queue:  make(chan taskItem, queueBuffer),
-		runner: &ExecRunner{Bin: cfg.OpencodeBin, Workdir: cfg.Workdir, BaseDir: cfg.BaseDir, Timeout: cfg.Timeout()},
+		runner: &ExecRunner{Bin: cfg.OpencodeBin, Workdir: cfg.Workdir, BaseDir: cfg.BaseDir, Agent: cfg.Agent, Timeout: cfg.Timeout()},
 		sender: &WacliSender{Bin: cfg.WacliBin, Phone: cfg.OwnerPhone},
 	}
 

@@ -5,6 +5,7 @@
   "owner_jid": "62xxxxxxxxxx@s.whatsapp.net",
   "owner_phone": "62812xxxxxxx",
   "workdir": "/home/zakaria/projects/wa-relay",
+  "agent": "stepi",
   "opencode_bin": "opencode",
   "wacli_bin": "wacli",
   "timeout_seconds": 480,

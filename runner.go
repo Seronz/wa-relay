@@ -101,13 +101,23 @@ type ExecRunner struct {
 	Bin     string
 	Workdir string
 	BaseDir string
+	Agent   string
 	Timeout time.Duration
+}
+
+// args builds the `opencode run` argument list. Exposed for testing.
+func (r *ExecRunner) args(prompt string) []string {
+	args := []string{"run", "--dir", r.Workdir, "--format", "json", "--title", "wa-relay"}
+	if r.Agent != "" {
+		args = append(args, "--agent", r.Agent)
+	}
+	return append(args, prompt)
 }
 
 func (r *ExecRunner) Run(ctx context.Context, prompt string) (string, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, r.Bin, "run", "--dir", r.Workdir, "--format", "json", "--title", "wa-relay", prompt)
+	cmd := exec.CommandContext(ctx, r.Bin, r.args(prompt)...)
 	cmd.Dir = r.BaseDir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {

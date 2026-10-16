@@ -21,6 +21,7 @@ type Config struct {
 	OwnerJID       string `json:"owner_jid"`
 	OwnerPhone     string `json:"owner_phone"`
 	Workdir        string `json:"workdir"`
+	Agent          string `json:"agent"`
 	OpencodeBin    string `json:"opencode_bin"`
 	WacliBin       string `json:"wacli_bin"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
@@ -49,6 +50,7 @@ func LoadConfig(path string) (*Config, error) {
 	cfg := &Config{
 		Host:           "127.0.0.1",
 		Port:           8791,
+		Agent:          "stepi",
 		OpencodeBin:    "opencode",
 		WacliBin:       "wacli",
 		TimeoutSeconds: 480,

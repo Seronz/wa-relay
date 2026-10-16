@@ -476,6 +476,20 @@ func TestWorkerLongReplyIsChunked(t *testing.T) {
 	}
 }
 
+func TestExecRunnerArgsIncludesAgent(t *testing.T) {
+	withAgent := strings.Join((&ExecRunner{Workdir: "/w", Agent: "stepi"}).args("halo"), " ")
+	wantWith := "run --dir /w --format json --title wa-relay --agent stepi halo"
+	if withAgent != wantWith {
+		t.Fatalf("args = %q, want %q", withAgent, wantWith)
+	}
+
+	withoutAgent := strings.Join((&ExecRunner{Workdir: "/w"}).args("halo"), " ")
+	wantWithout := "run --dir /w --format json --title wa-relay halo"
+	if withoutAgent != wantWithout {
+		t.Fatalf("args = %q, want %q", withoutAgent, wantWithout)
+	}
+}
+
 func TestExecRunnerCapturesStdout(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fake-opencode")
