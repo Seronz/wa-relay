@@ -151,6 +151,9 @@ func (s *SeenStore) persist() {
 type taskItem struct {
 	ID   string `json:"id"`
 	Text string `json:"text"`
+	// Chat adalah target mark-read untuk pesan ini, sudah dihitung handleHook
+	// lewat chatTarget (Chat -> SenderJID -> OwnerJID -> OwnerPhone).
+	Chat string `json:"chat"`
 }
 
 // TaskRunner runs the agent for a prompt and returns raw stdout/stderr.
@@ -310,10 +313,28 @@ func (r *Relay) StartWorkers(ctx context.Context) {
 	r.log.Info("worker pool started count=%d", n)
 }
 
+// markRead menandai chat pesan owner sebagai sudah dibaca lewat wacli.
+// Dipanggil dari handleMessage tepat sebelum balasan final dikirim, supaya
+// pesan yang masuk masih centang dua abu-abu dan hanya berubah biru ketika
+// balasan sudah disiapkan (termasuk untuk fast-path ping/reset dan balasan
+// error). Privasi read receipt diserahkan ke wacli lewat flag --receipts
+// (mengikuti setting privasi user), tidak diatur di sini.
+func (r *Relay) markRead(chat string) {
+	if r.reader == nil || !r.cfg.MarkRead || chat == "" {
+		return
+	}
+	if err := r.reader.MarkRead(chat); err != nil {
+		r.log.Warn("mark-read failed chat=%s err=%v", chat, err)
+		return
+	}
+	r.log.Info("mark-read ok chat=%s", chat)
+}
+
 func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 	start := time.Now()
 	r.log.Info("task start id=%s text_len=%d", item.ID, len(item.Text))
 	if strings.EqualFold(strings.TrimSpace(item.Text), "ping") {
+		r.markRead(item.Chat)
 		r.sendChunked("pong")
 		r.log.Info("task done id=%s fast-path duration=%.1fs", item.ID, time.Since(start).Seconds())
 		return
@@ -325,6 +346,7 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 				r.log.Error("session reset failed: %v", err)
 			}
 		}
+		r.markRead(item.Chat)
 		r.sendChunked("oke, kita mulai dari awal ya 😊")
 		r.log.Info("task done id=%s reset duration=%.1fs", item.ID, time.Since(start).Seconds())
 		return
@@ -369,12 +391,14 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 	}
 	if err != nil {
 		r.log.Error("opencode failed: %v (stderr %dB)", err, len(stderr))
+		r.markRead(item.Chat)
 		r.sendChunked(errorNote(err, stderr))
 		r.log.Info("task failed id=%s duration=%.1fs", item.ID, time.Since(start).Seconds())
 		return
 	}
 	r.log.Info("opencode done duration=%.1fs stdout=%dB stderr=%dB", time.Since(start).Seconds(), len(stdout), len(stderr))
 	reply := extractReply(stdout)
+	r.markRead(item.Chat)
 	r.sendChunked(reply)
 	r.log.Info("task done id=%s reply_len=%d duration=%.1fs", item.ID, len(reply), time.Since(start).Seconds())
 }

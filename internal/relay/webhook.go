@@ -116,11 +116,10 @@ func (r *Relay) handleHook(w http.ResponseWriter, req *http.Request) {
 		respond(w, http.StatusOK, map[string]any{"ok": true, "ignored": "duplicate"})
 		return
 	}
-	item := taskItem{ID: msg.ID, Text: strings.TrimSpace(msg.Text)}
+	item := taskItem{ID: msg.ID, Text: strings.TrimSpace(msg.Text), Chat: chatTarget(r.cfg, &msg)}
 	select {
 	case r.queue <- item:
 		r.log.Info("queued id=%s len=%d", item.ID, len(item.Text))
-		r.markRead(chatTarget(r.cfg, &msg))
 		respond(w, http.StatusOK, map[string]any{"ok": true, "queued": true})
 	default:
 		respond(w, http.StatusOK, map[string]any{"ok": true, "ignored": "queue-full"})
@@ -128,7 +127,9 @@ func (r *Relay) handleHook(w http.ResponseWriter, req *http.Request) {
 }
 
 // chatTarget memilih identifier chat untuk mark-read: chat asli pesan bila
-// ada, lalu sender, lalu fallback ke identitas owner dari config.
+// ada, lalu sender, lalu fallback ke identitas owner dari config. Hasilnya
+// dibawa lewat taskItem.Chat dan dipakai handleMessage tepat sebelum balasan
+// final dikirim.
 func chatTarget(cfg *Config, msg *hookPayload) string {
 	switch {
 	case msg.Chat != "":
@@ -140,22 +141,4 @@ func chatTarget(cfg *Config, msg *hookPayload) string {
 	default:
 		return cfg.OwnerPhone
 	}
-}
-
-// markRead menandai chat pesan owner yang sudah lolos filter/dedup sebagai
-// sudah dibaca lewat wacli. Berjalan async supaya respons webhook tidak
-// menunggu proses eksternal. Privasi read receipt diserahkan ke wacli lewat
-// flag --receipts (mengikuti setting privasi user), tidak diatur di sini.
-func (r *Relay) markRead(chat string) {
-	if r.reader == nil || !r.cfg.MarkRead || chat == "" {
-		return
-	}
-	reader := r.reader
-	go func() {
-		if err := reader.MarkRead(chat); err != nil {
-			r.log.Warn("mark-read failed chat=%s err=%v", chat, err)
-			return
-		}
-		r.log.Info("mark-read ok chat=%s", chat)
-	}()
 }
