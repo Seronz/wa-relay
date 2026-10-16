@@ -516,3 +516,59 @@ func TestExecRunnerTimeoutKillsProcessGroup(t *testing.T) {
 		t.Fatalf("timeout took %s, process group not killed", elapsed)
 	}
 }
+
+func TestLoggerNoDuplicateWhenStdoutIsSameFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay.log")
+	out, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+
+	log, err := newLogger(out, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log.Info("halo")
+	log.Close()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("log lines = %d, want 1 (tidak boleh ganda): %q", len(lines), string(data))
+	}
+	if !strings.Contains(lines[0], "halo") {
+		t.Fatalf("log tidak berisi pesan: %q", string(data))
+	}
+}
+
+func TestLoggerWritesToBothWhenDifferentTargets(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "relay.log")
+	outPath := filepath.Join(dir, "stdout.log")
+	out, err := os.OpenFile(outPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	log, err := newLogger(out, logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log.Info("ke-dua")
+	log.Close()
+	out.Close()
+
+	for _, p := range []string{logPath, outPath} {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("baca %s: %v", p, err)
+		}
+		if !strings.Contains(string(data), "ke-dua") {
+			t.Fatalf("%s tidak berisi log: %q", p, string(data))
+		}
+	}
+}

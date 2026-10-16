@@ -23,6 +23,15 @@ func newLogger(out io.Writer, logPath string) (*Logger, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open log file: %w", err)
 	}
+	// Hindari log ganda ketika stdout/stderr diarahkan ke file yang sama dengan
+	// log_file (mis. `start.sh` menjalankan `./wa-relay >>relay.log 2>&1`).
+	if f, ok := out.(*os.File); ok {
+		if outInfo, err := f.Stat(); err == nil {
+			if fileInfo, err := file.Stat(); err == nil && os.SameFile(outInfo, fileInfo) {
+				out = io.Discard
+			}
+		}
+	}
 	return &Logger{out: out, file: file}, nil
 }
 
