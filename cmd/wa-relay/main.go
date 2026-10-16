@@ -11,20 +11,20 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
-)
 
-const queueBuffer = 256
+	"github.com/Seronz/wa-relay/internal/relay"
+)
 
 func main() {
 	configPath := flag.String("config", "config.json", "path ke config.json")
 	flag.Parse()
 
-	cfg, err := LoadConfig(*configPath)
+	cfg, err := relay.LoadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "config:", err)
 		os.Exit(1)
 	}
-	log, err := NewLogger(cfg.LogFile)
+	log, err := relay.NewLogger(cfg.LogFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "log:", err)
 		os.Exit(1)
@@ -36,27 +36,26 @@ func main() {
 		fmt.Fprintln(os.Stderr, "state dir:", err)
 		os.Exit(1)
 	}
-	seen := LoadSeen(filepath.Join(stateDir, "seen.json"), maxSeen)
-	session := LoadSession(filepath.Join(stateDir, "session.json"))
+	seen := relay.LoadSeen(filepath.Join(stateDir, "seen.json"), relay.MaxSeen)
+	session := relay.LoadSession(filepath.Join(stateDir, "session.json"))
 
-	relay := &Relay{
-		cfg:     cfg,
-		log:     log,
-		seen:    seen,
-		session: session,
-		queue:   make(chan taskItem, queueBuffer),
-		runner:  &ExecRunner{Bin: cfg.OpencodeBin, Workdir: cfg.Workdir, BaseDir: cfg.BaseDir, Agent: cfg.Agent, Timeout: cfg.Timeout()},
-		sender:  &WacliSender{Bin: cfg.WacliBin, Phone: cfg.OwnerPhone},
-	}
+	r := relay.NewRelay(
+		cfg,
+		log,
+		seen,
+		session,
+		&relay.ExecRunner{Bin: cfg.OpencodeBin, Workdir: cfg.Workdir, BaseDir: cfg.BaseDir, Agent: cfg.Agent, Timeout: cfg.Timeout()},
+		&relay.WacliSender{Bin: cfg.WacliBin, Phone: cfg.OwnerPhone},
+	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	go relay.startWorkers(ctx)
+	go r.StartWorkers(ctx)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr(),
-		Handler:           relay.routes(),
+		Handler:           r.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {

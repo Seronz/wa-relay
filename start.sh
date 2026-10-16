@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 # bangun binary jika belum ada
 if [ ! -x ./wa-relay ]; then
   echo "building wa-relay..."
-  go build -o wa-relay .
+  go build -o wa-relay ./cmd/wa-relay
 fi
 
 PORT=$(python3 -c "import json;print(json.load(open('config.json')).get('port',8791))")

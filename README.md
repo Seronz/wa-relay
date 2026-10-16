@@ -68,7 +68,7 @@ sehingga agent **ingat percakapan sebelumnya** (tidak lagi lupa konteks antar pe
 ## Build & pemakaian
 
 ```bash
-go build -o wa-relay .   # atau langsung ./start.sh (auto-build kalau binary belum ada)
+go build -o wa-relay ./cmd/wa-relay   # atau langsung ./start.sh (auto-build kalau binary belum ada)
 ./start.sh               # restart relay + sync (delegasi ke systemd jika terpasang)
 ./stop.sh                # stop keduanya
 go test ./...            # jalankan test

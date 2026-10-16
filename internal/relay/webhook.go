@@ -1,4 +1,4 @@
-package main
+package relay
 
 import (
 	"crypto/hmac"
@@ -79,7 +79,8 @@ func respond(w http.ResponseWriter, code int, payload map[string]any) {
 	w.Write(body)
 }
 
-func (r *Relay) routes() http.Handler {
+// Routes mengembalikan handler HTTP untuk endpoint relay.
+func (r *Relay) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		respond(w, http.StatusOK, map[string]any{"ok": true})

@@ -1,4 +1,4 @@
-package main
+package relay
 
 import (
 	"bytes"
@@ -18,7 +18,8 @@ import (
 )
 
 const (
-	maxSeen         = 500
+	MaxSeen         = 500
+	queueBuffer     = 256
 	defaultChunk    = 3000
 	sendTimeout     = 120 * time.Second
 	stderrMaxRune   = 400
@@ -49,7 +50,7 @@ func LoadSeen(path string, max int) *SeenStore {
 		done:   make(chan struct{}),
 	}
 	if max <= 0 {
-		s.max = maxSeen
+		s.max = MaxSeen
 	}
 	data, err := os.ReadFile(path)
 	if err == nil {
@@ -234,6 +235,19 @@ type Relay struct {
 	sender  Sender
 }
 
+// NewRelay menyusun Relay lengkap dengan antrean dan dependensinya.
+func NewRelay(cfg *Config, log *Logger, seen *SeenStore, session *SessionStore, runner TaskRunner, sender Sender) *Relay {
+	return &Relay{
+		cfg:     cfg,
+		log:     log,
+		seen:    seen,
+		session: session,
+		queue:   make(chan taskItem, queueBuffer),
+		runner:  runner,
+		sender:  sender,
+	}
+}
+
 func (r *Relay) worker(ctx context.Context) {
 	for {
 		select {
@@ -248,10 +262,10 @@ func (r *Relay) worker(ctx context.Context) {
 	}
 }
 
-// startWorkers menjalankan beberapa worker sekaligus (worker pool) supaya satu
+// StartWorkers menjalankan beberapa worker sekaligus (worker pool) supaya satu
 // task yang lambat tidak menahan task lain di antrean. Jumlahnya dari config
 // num_workers (default defaultWorkers).
-func (r *Relay) startWorkers(ctx context.Context) {
+func (r *Relay) StartWorkers(ctx context.Context) {
 	n := r.cfg.NumWorkers
 	if n <= 0 {
 		n = defaultWorkers

@@ -1,4 +1,4 @@
-package main
+package relay
 
 import (
 	"bytes"
@@ -46,7 +46,7 @@ func newTestRelay(t *testing.T, cfg *Config, runner TaskRunner, sender Sender) *
 		t.Fatal(err)
 	}
 	t.Cleanup(log.Close)
-	seen := LoadSeen(filepath.Join(t.TempDir(), "seen.json"), maxSeen)
+	seen := LoadSeen(filepath.Join(t.TempDir(), "seen.json"), MaxSeen)
 	t.Cleanup(seen.Close)
 	return &Relay{
 		cfg:     cfg,
@@ -146,7 +146,7 @@ func postHook(t *testing.T, r *Relay, body []byte, sig string) *httptest.Respons
 		req.Header.Set("X-Wacli-Signature", sig)
 	}
 	rec := httptest.NewRecorder()
-	r.routes().ServeHTTP(rec, req)
+	r.Routes().ServeHTTP(rec, req)
 	return rec
 }
 
@@ -303,7 +303,7 @@ func TestHookQueuesValidMessageAndDedupes(t *testing.T) {
 func TestHealthEndpoint(t *testing.T) {
 	r := newTestRelay(t, testConfig(t), &stubRunner{}, &stubSender{})
 	rec := httptest.NewRecorder()
-	r.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	r.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code = %d, want 200", rec.Code)
 	}
@@ -312,7 +312,7 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	r.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
+	r.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("not found code = %d, want 404", rec.Code)
 	}
@@ -320,7 +320,7 @@ func TestHealthEndpoint(t *testing.T) {
 
 func TestSeenStorePersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "seen.json")
-	s := LoadSeen(path, maxSeen)
+	s := LoadSeen(path, MaxSeen)
 	defer s.Close()
 	if s.Seen("m1") {
 		t.Fatal("m1 should be new")
@@ -351,7 +351,7 @@ func TestSeenStorePersistence(t *testing.T) {
 		t.Fatalf("ids = %v, want [m1 m2]", ids)
 	}
 
-	reloaded := LoadSeen(path, maxSeen)
+	reloaded := LoadSeen(path, MaxSeen)
 	defer reloaded.Close()
 	if !reloaded.Seen("m1") {
 		t.Fatal("m1 should still be duplicate after reload")
@@ -363,7 +363,7 @@ func TestSeenStorePersistence(t *testing.T) {
 
 func TestSeenStoreKeepsLast500(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "seen.json")
-	s := LoadSeen(path, maxSeen)
+	s := LoadSeen(path, MaxSeen)
 	defer s.Close()
 	for i := 0; i < 600; i++ {
 		s.Seen(fmt.Sprintf("x%d", i))
@@ -377,14 +377,14 @@ func TestSeenStoreKeepsLast500(t *testing.T) {
 	if err := json.Unmarshal(data, &ids); err != nil {
 		t.Fatal(err)
 	}
-	if len(ids) != maxSeen {
-		t.Fatalf("persisted len = %d, want %d", len(ids), maxSeen)
+	if len(ids) != MaxSeen {
+		t.Fatalf("persisted len = %d, want %d", len(ids), MaxSeen)
 	}
 	if ids[0] != "x100" || ids[len(ids)-1] != "x599" {
 		t.Fatalf("window = [%s..%s], want [x100..x599]", ids[0], ids[len(ids)-1])
 	}
-	if len(s.ids) != maxSeen {
-		t.Fatalf("memory len = %d, want %d", len(s.ids), maxSeen)
+	if len(s.ids) != MaxSeen {
+		t.Fatalf("memory len = %d, want %d", len(s.ids), MaxSeen)
 	}
 	if !s.Seen("x599") || s.Seen("x600") {
 		t.Fatal("dedupe window incorrect after eviction")
@@ -490,7 +490,7 @@ func TestWorkerPoolRunsInParallel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r.startWorkers(ctx)
+	r.StartWorkers(ctx)
 
 	for i := 0; i < cfg.NumWorkers; i++ {
 		r.queue <- taskItem{ID: fmt.Sprintf("p%d", i), Text: "halo"}
