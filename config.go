@@ -31,6 +31,7 @@ type Config struct {
 	AckFollowups    []AckFollowup `json:"ack_followups"`
 	OpencodeBin     string        `json:"opencode_bin"`
 	WacliBin        string        `json:"wacli_bin"`
+	NumWorkers      int           `json:"num_workers"`
 	TimeoutSeconds  int           `json:"timeout_seconds"`
 	LogFile         string        `json:"log_file"`
 
@@ -80,6 +81,7 @@ func LoadConfig(path string) (*Config, error) {
 		},
 		OpencodeBin:    "opencode",
 		WacliBin:       "wacli",
+		NumWorkers:     defaultWorkers,
 		TimeoutSeconds: 900,
 	}
 	if err := json.Unmarshal(raw, cfg); err != nil {
@@ -101,6 +103,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Port == 0 {
 		cfg.Port = 8791
+	}
+	if cfg.NumWorkers <= 0 {
+		cfg.NumWorkers = defaultWorkers
 	}
 	return cfg, nil
 }

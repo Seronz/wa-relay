@@ -46,10 +46,12 @@ func newTestRelay(t *testing.T, cfg *Config, runner TaskRunner, sender Sender) *
 		t.Fatal(err)
 	}
 	t.Cleanup(log.Close)
+	seen := LoadSeen(filepath.Join(t.TempDir(), "seen.json"), maxSeen)
+	t.Cleanup(seen.Close)
 	return &Relay{
 		cfg:     cfg,
 		log:     log,
-		seen:    LoadSeen(filepath.Join(t.TempDir(), "seen.json"), maxSeen),
+		seen:    seen,
 		session: LoadSession(filepath.Join(t.TempDir(), "session.json")),
 		queue:   make(chan taskItem, 16),
 		runner:  runner,
@@ -101,6 +103,34 @@ func (s *stubRunner) Run(_ context.Context, prompt, sessionID string) (string, s
 		time.Sleep(delay)
 	}
 	return stdout, stderr, err
+}
+
+// poolRunner mencatat berapa banyak Run() yang jalan bersamaan, supaya bisa
+// membuktikan worker pool benar-benar paralel.
+type poolRunner struct {
+	mu        sync.Mutex
+	active    int
+	maxActive int
+	release   chan struct{}
+	once      sync.Once
+}
+
+func (p *poolRunner) Run(context.Context, string, string) (string, string, error) {
+	p.mu.Lock()
+	p.active++
+	if p.active > p.maxActive {
+		p.maxActive = p.active
+	}
+	reached := p.active >= defaultWorkers
+	p.mu.Unlock()
+	if reached {
+		p.once.Do(func() { close(p.release) })
+	}
+	<-p.release
+	p.mu.Lock()
+	p.active--
+	p.mu.Unlock()
+	return `{"type":"text","part":{"text":"ok"}}`, "", nil
 }
 
 func signBody(secret string, body []byte) string {
@@ -291,6 +321,7 @@ func TestHealthEndpoint(t *testing.T) {
 func TestSeenStorePersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "seen.json")
 	s := LoadSeen(path, maxSeen)
+	defer s.Close()
 	if s.Seen("m1") {
 		t.Fatal("m1 should be new")
 	}
@@ -300,6 +331,13 @@ func TestSeenStorePersistence(t *testing.T) {
 	if s.Seen("m2") {
 		t.Fatal("m2 should be new")
 	}
+
+	// Tiap pesan masuk tidak boleh langsung menulis file (debounce); baru
+	// ditulis saat flush berkala / Flush() dipanggil.
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("seen file sudah tertulis sebelum flush, err=%v", err)
+	}
+	s.Flush()
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -314,6 +352,7 @@ func TestSeenStorePersistence(t *testing.T) {
 	}
 
 	reloaded := LoadSeen(path, maxSeen)
+	defer reloaded.Close()
 	if !reloaded.Seen("m1") {
 		t.Fatal("m1 should still be duplicate after reload")
 	}
@@ -325,9 +364,11 @@ func TestSeenStorePersistence(t *testing.T) {
 func TestSeenStoreKeepsLast500(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "seen.json")
 	s := LoadSeen(path, maxSeen)
+	defer s.Close()
 	for i := 0; i < 600; i++ {
 		s.Seen(fmt.Sprintf("x%d", i))
 	}
+	s.Flush()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -428,6 +469,37 @@ func TestWorkerPingFastPath(t *testing.T) {
 	got := sender.messages()
 	if len(got) != 1 || got[0] != "pong" {
 		t.Fatalf("sent = %v, want [pong]", got)
+	}
+}
+
+func TestWorkerPoolRunsInParallel(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.NumWorkers = 3
+	runner := &poolRunner{release: make(chan struct{})}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, runner, sender)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.startWorkers(ctx)
+
+	for i := 0; i < cfg.NumWorkers; i++ {
+		r.queue <- taskItem{ID: fmt.Sprintf("p%d", i), Text: "halo"}
+	}
+
+	deadline := time.After(3 * time.Second)
+	for len(sender.messages()) < cfg.NumWorkers {
+		select {
+		case <-deadline:
+			t.Fatalf("cuma %d tugas selesai, worker pool tidak paralel", len(sender.messages()))
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	runner.mu.Lock()
+	max := runner.maxActive
+	runner.mu.Unlock()
+	if max < cfg.NumWorkers {
+		t.Fatalf("max paralel = %d, mau >= %d (worker cuma satu?)", max, cfg.NumWorkers)
 	}
 }
 
@@ -536,6 +608,28 @@ func TestSendScheduledSkipsNonPositive(t *testing.T) {
 	r.sendScheduled(context.Background(), taskItem{ID: "s"})
 	if got := sender.messages(); len(got) != 0 {
 		t.Fatalf("sent = %v, want none", got)
+	}
+}
+
+func TestHandleMessageStopsScheduleAfterReply(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.AckDelaySeconds = 1
+	cfg.AckMessages = []string{"ack"}
+	cfg.AckFollowups = []AckFollowup{{AfterSeconds: 2, Messages: []string{"followup"}}}
+	runner := &stubRunner{stdout: `{"type":"text","part":{"text":"jawaban"}}`, delay: 1200 * time.Millisecond}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, runner, sender)
+
+	r.handleMessage(context.Background(), taskItem{ID: "s", Text: "halo"})
+	// Task kelar ~1.2s: ack (1s) sudah terkirim, followup (2s) tidak boleh nyusul
+	// setelah reply final terkirim.
+	got := sender.messages()
+	if len(got) != 2 || got[0] != "ack" || got[1] != "jawaban" {
+		t.Fatalf("sent = %v, want [ack jawaban]", got)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if got := sender.messages(); len(got) != 2 {
+		t.Fatalf("followup nyusul setelah reply final: %v", got)
 	}
 }
 

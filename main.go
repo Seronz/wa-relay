@@ -52,7 +52,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	go relay.worker(ctx)
+	go relay.startWorkers(ctx)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr(),
@@ -74,6 +74,6 @@ func main() {
 		log.Error("server: %v", err)
 		os.Exit(1)
 	}
-	seen.persist()
+	seen.Close()
 	log.Info("stopped")
 }

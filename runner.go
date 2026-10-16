@@ -17,22 +17,36 @@ import (
 )
 
 const (
-	maxSeen       = 500
-	defaultChunk  = 3000
-	sendTimeout   = 120 * time.Second
-	stderrMaxRune = 400
+	maxSeen         = 500
+	defaultChunk    = 3000
+	sendTimeout     = 120 * time.Second
+	stderrMaxRune   = 400
+	seenFlushPeriod = 2 * time.Second
+	defaultWorkers  = 3
 )
 
 type SeenStore struct {
-	mu   sync.Mutex
-	ids  []string
-	set  map[string]struct{}
-	path string
-	max  int
+	mu       sync.Mutex
+	ids      []string
+	set      map[string]struct{}
+	path     string
+	max      int
+	dirty    bool
+	period   time.Duration
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 func LoadSeen(path string, max int) *SeenStore {
-	s := &SeenStore{path: path, max: max, set: make(map[string]struct{})}
+	s := &SeenStore{
+		path:   path,
+		max:    max,
+		set:    make(map[string]struct{}),
+		period: seenFlushPeriod,
+		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
+	}
 	if max <= 0 {
 		s.max = maxSeen
 	}
@@ -51,14 +65,33 @@ func LoadSeen(path string, max int) *SeenStore {
 			}
 		}
 	}
+	go s.flushLoop()
 	return s
 }
 
-// Seen reports whether id was already recorded. New ids are recorded and persisted.
+// flushLoop menulis state ke disk secara berkala, tapi hanya kalau ada
+// perubahan (dirty). Jadi pesan yang datang beruntun tidak memicu I/O
+// berkali-kali.
+func (s *SeenStore) flushLoop() {
+	defer close(s.done)
+	ticker := time.NewTicker(s.period)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-ticker.C:
+			s.persist()
+		}
+	}
+}
+
+// Seen reports whether id was already recorded. New ids ditandai dirty saja;
+// penulisan file ditunda dan di-flush berkala oleh flushLoop (debounce I/O).
 func (s *SeenStore) Seen(id string) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, dup := s.set[id]; dup {
-		s.mu.Unlock()
 		return true
 	}
 	s.set[id] = struct{}{}
@@ -69,20 +102,44 @@ func (s *SeenStore) Seen(id string) bool {
 		}
 		s.ids = s.ids[len(s.ids)-s.max:]
 	}
-	s.mu.Unlock()
-	s.persist()
+	s.dirty = true
 	return false
+}
+
+// Flush memaksa penulisan state ke disk sekarang (mis. saat shutdown).
+func (s *SeenStore) Flush() {
+	s.persist()
+}
+
+// Close menghentikan flush berkala lalu menulis sisa perubahan terakhir.
+func (s *SeenStore) Close() {
+	s.stopOnce.Do(func() {
+		close(s.stop)
+		<-s.done
+	})
+	s.persist()
 }
 
 func (s *SeenStore) persist() {
 	s.mu.Lock()
+	if !s.dirty {
+		s.mu.Unlock()
+		return
+	}
+	s.dirty = false
 	data, err := json.Marshal(s.ids)
 	s.mu.Unlock()
 	if err != nil {
+		s.mu.Lock()
+		s.dirty = true
+		s.mu.Unlock()
 		return
 	}
 	tmp := s.path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		s.mu.Lock()
+		s.dirty = true
+		s.mu.Unlock()
 		return
 	}
 	os.Rename(tmp, s.path)
@@ -190,6 +247,20 @@ func (r *Relay) worker(ctx context.Context) {
 	}
 }
 
+// startWorkers menjalankan beberapa worker sekaligus (worker pool) supaya satu
+// task yang lambat tidak menahan task lain di antrean. Jumlahnya dari config
+// num_workers (default defaultWorkers).
+func (r *Relay) startWorkers(ctx context.Context) {
+	n := r.cfg.NumWorkers
+	if n <= 0 {
+		n = defaultWorkers
+	}
+	for i := 0; i < n; i++ {
+		go r.worker(ctx)
+	}
+	r.log.Info("worker pool started count=%d", n)
+}
+
 func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 	start := time.Now()
 	r.log.Info("task start id=%s text_len=%d", item.ID, len(item.Text))
@@ -211,9 +282,24 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 	}
 	// Ack pertama & follow-up hanya dikirim kalau task masih jalan (lihat
 	// sendScheduled). Task yang cepat selesai cukup dapat jawaban langsung.
-	taskCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go r.sendScheduled(taskCtx, item)
+	taskCtx, cancelTask := context.WithCancel(ctx)
+	defer cancelTask()
+
+	// sendScheduled TIDAK boleh ikut context handleMessage, karena context itu
+	// di-cancel begitu handleMessage return dan bisa memotong followup terakhir
+	// pas reply final keburu dikirim. Pakai context yang dilepas (WithoutCancel),
+	// lalu stop eksplisit setelah reply final terkirim sambil menunggu kiriman
+	// yang sedang jalan selesai dulu.
+	schedCtx, stopSchedule := context.WithCancel(context.WithoutCancel(ctx))
+	scheduleDone := make(chan struct{})
+	go func() {
+		defer close(scheduleDone)
+		r.sendScheduled(schedCtx, item)
+	}()
+	defer func() {
+		stopSchedule()
+		<-scheduleDone
+	}()
 
 	// Lanjutkan sesi opencode yang sama supaya agent ingat obrolan sebelumnya.
 	sessionID := ""
@@ -264,7 +350,10 @@ func pickRandom(messages []string) string {
 
 // sendScheduled mengirim ack pertama (setelah ack_delay_seconds) dan follow-up
 // berikutnya, tapi hanya selama task belum selesai. after_seconds dihitung dari
-// awal task, dan berhenti begitu ctx dibatalkan.
+// awal task. ctx di sini sudah dilepas dari context handleMessage
+// (context.WithoutCancel), jadi pengiriman yang sedang jalan tidak kepotong saat
+// handleMessage return; pemberhentian diatur eksplisit oleh pemanggil setelah
+// reply final terkirim.
 func (r *Relay) sendScheduled(ctx context.Context, item taskItem) {
 	start := time.Now()
 	if r.cfg.AckDelaySeconds > 0 && len(r.cfg.AckMessages) > 0 {

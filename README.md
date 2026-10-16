@@ -12,7 +12,7 @@ wacli sync --follow  ──webhook──►  wa-relay (Go)  (127.0.0.1:8791/hook
                                       │  verifikasi HMAC, filter owner,
                                       │  dedupe ID, respon 200 segera
                                       ▼
-                                  antrean (queue) ──1 worker goroutine──►
+                                  antrean (queue) ──worker pool (num_workers)──►
                                       │
                                       ▼
                               opencode run --format json
@@ -59,6 +59,7 @@ sehingga agent **ingat percakapan sebelumnya** (tidak lagi lupa konteks antar pe
 | `ack_messages` | Pool ack pertama (dipilih acak), dikirim setelah `ack_delay_seconds`; `[]` untuk menonaktifkan |
 | `ack_followups` | Array `{after_seconds, messages}`, pesan susulan bila task belum selesai (default 600s) |
 | `opencode_bin` / `wacli_bin` | Path binary |
+| `num_workers` | Jumlah worker paralel yang menguras antrean (default 3) |
 | `timeout_seconds` | Timeout `opencode run` (default 900) |
 | `log_file` | Log file relay |
 
@@ -110,7 +111,7 @@ dari `config.json` lewat `run-sync.sh`.
 - Hanya listen di `127.0.0.1` (localhost).
 - Setiap webhook diverifikasi HMAC-SHA256; signature salah → 401.
 - Hanya pesan dari `owner_jid`, bukan `FromMe`, bukan grup/channel/status, teks kosong diabaikan.
-- Dedupe by message `ID` (500 terakhir, disimpan di `state/seen.json`).
+- Dedupe by message `ID` (500 terakhir, disimpan di `state/seen.json`; penulisan di-debounce tiap 2 detik).
 - Sesi opencode terakhir disimpan di `state/session.json` (hapus untuk reset).
 - Policy permission agent di `opencode.json` (bisa diketatkan).
 
