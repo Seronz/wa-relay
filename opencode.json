@@ -7,6 +7,14 @@
     "grep": "allow",
     "list": "allow",
     "external_directory": { "*": "allow" },
-    "bash": { "*": "allow", "rm -rf *": "deny", "sudo *": "deny", "git push *": "deny" }
+    "bash": {
+      "*": "allow",
+      "rm -rf *": "deny",
+      "sudo *": "deny",
+      "git push*": "deny",
+      "git push* fix*": "allow",
+      "git push*main*": "deny",
+      "git push*master*": "deny"
+    }
   }
 }

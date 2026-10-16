@@ -10,7 +10,7 @@ import (
 
 const promptTemplate = "Pesan WhatsApp dari irza:\n---\n%s\n---\n" +
 	"Balas sebagai dirimu sendiri, singkat dan natural (bahasa Indonesia santai/gaul). " +
-	"Langsung ke balasan, tanpa judul markdown, tanpa tabel, tanpa fence kode."
+	"Langsung ke balasan, tanpa proses berpikir, tanpa judul markdown, tanpa tabel, tanpa fence kode."
 
 // AckFollowup mengirim pesan penyemangat setelah task berjalan sekian detik.
 type AckFollowup struct {
