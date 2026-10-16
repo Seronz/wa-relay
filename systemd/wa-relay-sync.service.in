@@ -1,0 +1,17 @@
+[Unit]
+Description=wa-relay - wacli sync (webhook ke relay)
+After=wa-relay.service
+Requires=wa-relay.service
+
+[Service]
+Type=simple
+WorkingDirectory=__BASE_DIR__
+Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=__BASE_DIR__/run-sync.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:__BASE_DIR__/sync.log
+StandardError=append:__BASE_DIR__/sync.log
+
+[Install]
+WantedBy=default.target

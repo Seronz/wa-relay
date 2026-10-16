@@ -1,0 +1,16 @@
+[Unit]
+Description=wa-relay - jembatan WhatsApp -> opencode -> WhatsApp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__BASE_DIR__
+Environment=PATH=__HOME__/.opencode/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=__BASE_DIR__/wa-relay -config __BASE_DIR__/config.json
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

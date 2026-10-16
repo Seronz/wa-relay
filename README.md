@@ -54,12 +54,42 @@ Pesan `ping` (case-insensitive) dibalas `pong` langsung tanpa memanggil agent.
 
 ```bash
 go build -o wa-relay .   # atau langsung ./start.sh (auto-build kalau binary belum ada)
-./start.sh               # idempotent: restart sync + relay, baca secret dari config.json
-./stop.sh                # stop keduanya (pidfile + fallback pkill)
+./start.sh               # restart relay + sync (delegasi ke systemd jika terpasang)
+./stop.sh                # stop keduanya
 go test ./...            # jalankan test
 ```
 
+`start.sh` / `stop.sh` otomatis memakai **systemd user service** kalau sudah terpasang
+(`systemctl --user cat wa-relay.service` berhasil); kalau belum, jatuh ke mode manual
+(`setsid`/`nohup` + pidfile).
+
 Log: `relay.log` (relay) dan `sync.log` (wacli sync). Health check: `curl http://127.0.0.1:8791/health` → `{"ok":true}`.
+
+## Systemd (always-on)
+
+Biar relay selalu nyala (auto-restart saat crash, auto-start saat boot, jalan tanpa login):
+
+```bash
+./systemd/install.sh     # pasang + enable + start (idempotent)
+```
+
+`install.sh` akan:
+- menaruh `wa-relay.service` & `wa-relay-sync.service` ke `~/.config/systemd/user/`
+  (path repo & `$HOME` di-substitusi otomatis dari `systemd/*.service.in`),
+- `daemon-reload` + `enable --now` kedua service,
+- `loginctl enable-linger $USER` supaya tetap jalan walau tidak ada sesi login.
+
+Kontrol manual:
+
+```bash
+systemctl --user status wa-relay wa-relay-sync
+systemctl --user restart wa-relay-sync     # sync saja
+systemctl --user stop wa-relay wa-relay-sync
+journalctl --user -u wa-relay -f           # log relay (streaming)
+```
+
+`wa-relay-sync.service` meng-`Requires` + `After` `wa-relay.service`, dan secret dibaca
+dari `config.json` lewat `run-sync.sh`.
 
 ## Keamanan
 
@@ -73,4 +103,4 @@ Log: `relay.log` (relay) dan `sync.log` (wacli sync). Health check: `curl http:/
 
 - Owner: edit `owner_jid` + `owner_phone` di `config.json`, lalu `./start.sh`.
 - Timeout agent: `timeout_seconds`.
-- Secret: ganti `webhook_secret` (mis. `python3 -c "import secrets;print(secrets.token_hex(32))"`) di `config.json` dan di wacli sync — `start.sh` membacanya otomatis dari config.
+- Secret: ganti `webhook_secret` (mis. `python3 -c "import secrets;print(secrets.token_hex(32))"`) di `config.json`, lalu restart: `./start.sh` (atau `systemctl --user restart wa-relay wa-relay-sync`). `start.sh`/`run-sync.sh` membacanya otomatis dari config.

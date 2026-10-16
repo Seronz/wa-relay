@@ -1,19 +1,33 @@
 #!/usr/bin/env bash
-# Idempotent start: build + jalankan wa-relay (Go) dan wacli sync --follow (webhook ke relay).
-# Semua proses dilepas (setsid + nohup + </dev/null) agar shell pemanggil tidak ikut tertahan.
+# Idempotent start untuk wa-relay.
+# Kalau systemd user service terpasang -> delegasi ke systemctl (lihat systemd/install.sh).
+# Kalau tidak -> mode manual lama (setsid + nohup + pidfile).
 set -euo pipefail
 cd "$(dirname "$0")"
-
-SECRET=$(python3 -c "import json;print(json.load(open('config.json')).get('webhook_secret',''))")
-PORT=$(python3 -c "import json;print(json.load(open('config.json')).get('port',8791))")
-LOG=${LOG_FILE:-relay.log}
-SYNC_LOG=${SYNC_LOG:-sync.log}
 
 # bangun binary jika belum ada
 if [ ! -x ./wa-relay ]; then
   echo "building wa-relay..."
   go build -o wa-relay .
 fi
+
+PORT=$(python3 -c "import json;print(json.load(open('config.json')).get('port',8791))")
+
+# ---- mode systemd ----
+if systemctl --user cat wa-relay.service >/dev/null 2>&1; then
+  echo "starting via systemd..."
+  systemctl --user restart wa-relay.service
+  systemctl --user restart wa-relay-sync.service
+  systemctl --user --no-pager --lines=0 status wa-relay.service wa-relay-sync.service | grep -E "Active:" || true
+  sleep 1
+  echo "health: $(curl -s -m 5 "http://127.0.0.1:${PORT}/health" || echo 'belum siap')"
+  exit 0
+fi
+
+# ---- mode manual (fallback) ----
+SECRET=$(python3 -c "import json;print(json.load(open('config.json')).get('webhook_secret',''))")
+LOG=${LOG_FILE:-relay.log}
+SYNC_LOG=${SYNC_LOG:-sync.log}
 
 # (a) hentikan wacli sync --follow lama untuk store ini
 if [ -f sync.pid ]; then
