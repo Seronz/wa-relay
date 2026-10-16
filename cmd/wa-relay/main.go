@@ -38,12 +38,19 @@ func main() {
 	}
 	seen := relay.LoadSeen(filepath.Join(stateDir, "seen.json"), relay.MaxSeen)
 	session := relay.LoadSession(filepath.Join(stateDir, "session.json"))
+	workSession := (*relay.SessionStore)(nil)
+	if cfg.WorkSessionFile != "" {
+		workSession = relay.LoadSession(cfg.WorkSessionFile)
+	} else {
+		workSession = relay.LoadSession(filepath.Join(stateDir, "work-session.json"))
+	}
 
-	r := relay.NewRelay(
+	r := relay.NewRelayWithWork(
 		cfg,
 		log,
 		seen,
 		session,
+		workSession,
 		&relay.ExecRunner{Bin: cfg.OpencodeBin, Workdir: cfg.Workdir, BaseDir: cfg.BaseDir, Agent: cfg.Agent, Timeout: cfg.Timeout()},
 		&relay.WacliSender{Bin: cfg.WacliBin, Phone: cfg.OwnerPhone},
 		&relay.WacliMarkReader{Bin: cfg.WacliBin},

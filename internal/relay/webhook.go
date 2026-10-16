@@ -116,10 +116,16 @@ func (r *Relay) handleHook(w http.ResponseWriter, req *http.Request) {
 		respond(w, http.StatusOK, map[string]any{"ok": true, "ignored": "duplicate"})
 		return
 	}
-	item := taskItem{ID: msg.ID, Text: strings.TrimSpace(msg.Text), Chat: chatTarget(r.cfg, &msg)}
+	item := taskItem{ID: msg.ID, Text: strings.TrimSpace(msg.Text), Chat: chatTarget(r.cfg, &msg), Lane: Classify(r.cfg, msg.Text)}
 	select {
+	case r.chatQueue <- item:
+		r.log.Info("queued id=%s len=%d lane=chat", item.ID, len(item.Text))
+		respond(w, http.StatusOK, map[string]any{"ok": true, "queued": true})
+	case r.workQueue <- item:
+		r.log.Info("queued id=%s len=%d lane=work", item.ID, len(item.Text))
+		respond(w, http.StatusOK, map[string]any{"ok": true, "queued": true})
 	case r.queue <- item:
-		r.log.Info("queued id=%s len=%d", item.ID, len(item.Text))
+		r.log.Info("queued id=%s len=%d lane=unified", item.ID, len(item.Text))
 		respond(w, http.StatusOK, map[string]any{"ok": true, "queued": true})
 	default:
 		respond(w, http.StatusOK, map[string]any{"ok": true, "ignored": "queue-full"})

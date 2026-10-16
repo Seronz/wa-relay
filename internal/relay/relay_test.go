@@ -49,13 +49,16 @@ func newTestRelay(t *testing.T, cfg *Config, runner TaskRunner, sender Sender) *
 	seen := LoadSeen(filepath.Join(t.TempDir(), "seen.json"), MaxSeen)
 	t.Cleanup(seen.Close)
 	return &Relay{
-		cfg:     cfg,
-		log:     log,
-		seen:    seen,
-		session: LoadSession(filepath.Join(t.TempDir(), "session.json")),
-		queue:   make(chan taskItem, 16),
-		runner:  runner,
-		sender:  sender,
+		cfg:         cfg,
+		log:         log,
+		seen:        seen,
+		session:     LoadSession(filepath.Join(t.TempDir(), "session.json")),
+		workSession: LoadSession(filepath.Join(t.TempDir(), "work-session.json")),
+		chatQueue:   make(chan taskItem, 16),
+		workQueue:   make(chan taskItem, 16),
+		queue:       make(chan taskItem, 16),
+		runner:      runner,
+		sender:      sender,
 	}
 }
 
@@ -260,6 +263,10 @@ func hookItem(t *testing.T, r *Relay, cfg *Config, payload map[string]any) taskI
 	select {
 	case item := <-r.queue:
 		return item
+	case item := <-r.chatQueue:
+		return item
+	case item := <-r.workQueue:
+		return item
 	default:
 		t.Fatal("expected an item in queue")
 		return taskItem{}
@@ -369,7 +376,7 @@ func TestHookIgnoreFilters(t *testing.T) {
 			if got := decodeBody(t, rec)["ignored"]; got != tc.want {
 				t.Fatalf("ignored = %v, want %v", got, tc.want)
 			}
-			if len(r.queue) != 0 {
+			if len(r.queue) != 0 || len(r.chatQueue) != 0 || len(r.workQueue) != 0 {
 				t.Fatal("nothing should be queued")
 			}
 		})
@@ -392,13 +399,16 @@ func TestHookQueuesValidMessageAndDedupes(t *testing.T) {
 	if got["queued"] != true || got["ok"] != true {
 		t.Fatalf("response = %v, want queued true", got)
 	}
+	var item taskItem
 	select {
-	case item := <-r.queue:
-		if item.ID != "MSG1" || item.Text != "halo dunia" {
-			t.Fatalf("queued item = %+v", item)
-		}
+	case item = <-r.queue:
+	case item = <-r.chatQueue:
+	case item = <-r.workQueue:
 	default:
 		t.Fatal("expected an item in queue")
+	}
+	if item.ID != "MSG1" || item.Text != "halo dunia" {
+		t.Fatalf("queued item = %+v", item)
 	}
 
 	rec = postHook(t, r, body, signBody(cfg.WebhookSecret, body))
@@ -872,7 +882,7 @@ func TestRelayPersistsAndReusesSession(t *testing.T) {
 	if got := r.session.ID(); got != "ses_test" {
 		t.Fatalf("session id = %q, want ses_test", got)
 	}
-	if got := LoadSession(r.session.path).ID(); got != "ses_test" {
+	if got := LoadSession(r.session.Path()).ID(); got != "ses_test" {
 		t.Fatalf("persisted session = %q, want ses_test", got)
 	}
 
@@ -1266,7 +1276,7 @@ func TestDuplicateMessageDoesNotMarkReadAgain(t *testing.T) {
 	if got := decodeBody(t, rec)["ignored"]; got != "duplicate" {
 		t.Fatalf("ignored = %v, want duplicate", got)
 	}
-	if len(r.queue) != 0 {
+	if len(r.queue) != 0 || len(r.chatQueue) != 0 || len(r.workQueue) != 0 {
 		t.Fatal("duplikat tidak boleh masuk antrean")
 	}
 	if got := reader.calls(); len(got) != 1 {

@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -38,6 +41,28 @@ type Config struct {
 	// diterima. Default true; set false untuk mematikannya.
 	MarkRead bool `json:"mark_read"`
 
+	// ChatWorkers adalah jumlah worker lane chat (pesan ringan). Default 1,
+	// supaya sesi chat hanya dipakai satu `opencode run` pada satu waktu
+	// (serialisasi per sesi) dan balasan ringan tidak pernah berebut sesi.
+	ChatWorkers int `json:"chat_workers"`
+	// LightMaxLen adalah panjang maksimal (rune) pesan yang masih dianggap
+	// ringan; lebih panjang dari ini diarahkan ke lane work. Default 400.
+	LightMaxLen int `json:"light_max_len"`
+	// HeavyKeywords menambah kata kunci routing ke lane work selain
+	// defaultHeavyKeywords (cocok kata per kata, tanpa memperhatikan huruf besar/kecil).
+	HeavyKeywords []string `json:"heavy_keywords"`
+	// ChatSessionFile adalah file penyimpanan sesi chat WhatsApp.
+	// Default <base>/state/session.json (memori percakapan chat dipertahankan).
+	ChatSessionFile string `json:"chat_session_file"`
+	// WorkSessionFile adalah file sesi tugas berat. Kosong (default) berarti
+	// tiap tugas berat memakai sesi baru (tidak pernah berbagi sesi, tidak
+	// menimpa sesi chat). Diset -> semua tugas berat berlanjut di sesi
+	// terpisah tersebut (aman dari sesi chat, tetap diserialisasi gate per-sesi).
+	WorkSessionFile string `json:"work_session_file"`
+
+	heavyOnce sync.Once
+	heavyRe   *regexp.Regexp
+
 	BaseDir string `json:"-"`
 }
 
@@ -51,6 +76,27 @@ func (c *Config) Timeout() time.Duration {
 		s = 480
 	}
 	return time.Duration(s) * time.Second
+}
+
+// HeavyPattern mengompilasi regex kata kunci tugas berat (default + config)
+// secara lazy dan cache. Cocok kata per kata dengan word boundary, jadi
+// "protes" tidak dianggap mengandung "test".
+func (c *Config) HeavyPattern() *regexp.Regexp {
+	c.heavyOnce.Do(func() {
+		patterns := make([]string, 0, len(defaultHeavyKeywords)+len(c.HeavyKeywords))
+		for _, k := range append(append([]string{}, defaultHeavyKeywords...), c.HeavyKeywords...) {
+			k = strings.ToLower(strings.TrimSpace(k))
+			if k == "" {
+				continue
+			}
+			patterns = append(patterns, regexp.QuoteMeta(k))
+		}
+		if len(patterns) == 0 {
+			return
+		}
+		c.heavyRe = regexp.MustCompile(`(?i)\b(?:` + strings.Join(patterns, "|") + `)\b`)
+	})
+	return c.heavyRe
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -85,6 +131,8 @@ func LoadConfig(path string) (*Config, error) {
 		OpencodeBin:    "opencode",
 		WacliBin:       "wacli",
 		NumWorkers:     defaultWorkers,
+		ChatWorkers:    defaultChatWorkers,
+		LightMaxLen:    defaultLightMaxLen,
 		TimeoutSeconds: 900,
 		MarkRead:       true,
 	}
@@ -110,6 +158,15 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.NumWorkers <= 0 {
 		cfg.NumWorkers = defaultWorkers
+	}
+	if cfg.ChatWorkers <= 0 {
+		cfg.ChatWorkers = defaultChatWorkers
+	}
+	if cfg.LightMaxLen <= 0 {
+		cfg.LightMaxLen = defaultLightMaxLen
+	}
+	if cfg.ChatSessionFile == "" {
+		cfg.ChatSessionFile = filepath.Join(cfg.BaseDir, "state", "session.json")
 	}
 	return cfg, nil
 }

@@ -49,3 +49,11 @@ func (s *SessionStore) Set(id string) error {
 	}
 	return os.Rename(tmp, s.path)
 }
+
+// Path mengembalikan lokasi file store.
+func (s *SessionStore) Path() string {
+	if s == nil {
+		return ""
+	}
+	return s.path
+}

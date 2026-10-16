@@ -18,14 +18,16 @@ import (
 )
 
 const (
-	MaxSeen         = 500
-	queueBuffer     = 256
-	defaultChunk    = 3000
-	sendTimeout     = 120 * time.Second
-	markReadTimeout = 30 * time.Second
-	stderrMaxRune   = 400
-	seenFlushPeriod = 2 * time.Second
-	defaultWorkers  = 3
+	MaxSeen            = 500
+	queueBuffer        = 256
+	defaultChunk       = 3000
+	sendTimeout        = 120 * time.Second
+	markReadTimeout    = 30 * time.Second
+	stderrMaxRune      = 400
+	seenFlushPeriod    = 2 * time.Second
+	defaultWorkers     = 3
+	defaultChatWorkers = 1
+	defaultLightMaxLen = 400
 )
 
 type SeenStore struct {
@@ -154,6 +156,7 @@ type taskItem struct {
 	// Chat adalah target mark-read untuk pesan ini, sudah dihitung handleHook
 	// lewat chatTarget (Chat -> SenderJID -> OwnerJID -> OwnerPhone).
 	Chat string `json:"chat"`
+	Lane Lane   `json:"lane"`
 }
 
 // TaskRunner runs the agent for a prompt and returns raw stdout/stderr.
@@ -261,27 +264,39 @@ func (m *WacliMarkReader) MarkRead(chat string) error {
 }
 
 type Relay struct {
-	cfg     *Config
-	log     *Logger
-	seen    *SeenStore
-	session *SessionStore
-	queue   chan taskItem
-	runner  TaskRunner
-	sender  Sender
-	reader  MarkReader
+	cfg         *Config
+	log         *Logger
+	seen        *SeenStore
+	session     *SessionStore // sesi chat WhatsApp (dipertahankan ingatannya)
+	workSession *SessionStore // sesi tugas berat (opsional, terpisah dari chat)
+	queue       chan taskItem // antrean unified (legacy dipakai di test, kita perlu tetap bisa? kita ubah -> punya dua lane)
+	chatQueue   chan taskItem
+	workQueue   chan taskItem
+	runner      TaskRunner
+	sender      Sender
+	reader      MarkReader
+	gate        sessionGate
 }
 
 // NewRelay menyusun Relay lengkap dengan antrean dan dependensinya.
 func NewRelay(cfg *Config, log *Logger, seen *SeenStore, session *SessionStore, runner TaskRunner, sender Sender, reader MarkReader) *Relay {
+	return NewRelayWithWork(cfg, log, seen, session, nil, runner, sender, reader)
+}
+
+// NewRelayWithWork menyusun Relay dengan sesi kerja terpisah (opsional).
+func NewRelayWithWork(cfg *Config, log *Logger, seen *SeenStore, chatSession, workSession *SessionStore, runner TaskRunner, sender Sender, reader MarkReader) *Relay {
 	return &Relay{
-		cfg:     cfg,
-		log:     log,
-		seen:    seen,
-		session: session,
-		queue:   make(chan taskItem, queueBuffer),
-		runner:  runner,
-		sender:  sender,
-		reader:  reader,
+		cfg:         cfg,
+		log:         log,
+		seen:        seen,
+		session:     chatSession,
+		workSession: workSession,
+		chatQueue:   make(chan taskItem, queueBuffer),
+		workQueue:   make(chan taskItem, queueBuffer),
+		queue:       make(chan taskItem, queueBuffer), // legacy support for tests
+		runner:      runner,
+		sender:      sender,
+		reader:      reader,
 	}
 }
 
@@ -292,7 +307,55 @@ func (r *Relay) worker(ctx context.Context) {
 			return
 		case item, ok := <-r.queue:
 			if !ok {
+				continue
+			}
+			r.handleMessage(ctx, item)
+		case item, ok := <-r.chatQueue:
+			if !ok {
+				continue
+			}
+			r.handleMessage(ctx, item)
+		case item, ok := <-r.workQueue:
+			if !ok {
+				continue
+			}
+			r.handleMessage(ctx, item)
+		}
+	}
+}
+
+func (r *Relay) chatWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case item, ok := <-r.chatQueue:
+			if !ok {
 				return
+			}
+			r.handleMessage(ctx, item)
+		case item, ok := <-r.queue:
+			if !ok {
+				continue
+			}
+			r.handleMessage(ctx, item)
+		}
+	}
+}
+
+func (r *Relay) workWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case item, ok := <-r.workQueue:
+			if !ok {
+				return
+			}
+			r.handleMessage(ctx, item)
+		case item, ok := <-r.queue:
+			if !ok {
+				continue
 			}
 			r.handleMessage(ctx, item)
 		}
@@ -307,10 +370,14 @@ func (r *Relay) StartWorkers(ctx context.Context) {
 	if n <= 0 {
 		n = defaultWorkers
 	}
+	chat := r.cfg.ChatWorkers
+	if chat <= 0 {
+		chat = defaultChatWorkers
+	}
 	for i := 0; i < n; i++ {
 		go r.worker(ctx)
 	}
-	r.log.Info("worker pool started count=%d", n)
+	r.log.Info("worker pool started count=%d (chat=%d)", n, chat)
 }
 
 // markRead menandai chat pesan owner sebagai sudah dibaca lewat wacli.
@@ -374,18 +441,47 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 
 	// Lanjutkan sesi opencode yang sama supaya agent ingat obrolan sebelumnya.
 	sessionID := ""
-	if r.session != nil {
-		sessionID = r.session.ID()
+	if item.Lane == LaneWork {
+		if r.workSession != nil {
+			sessionID = r.workSession.ID()
+		}
+	} else {
+		if r.session != nil {
+			sessionID = r.session.ID()
+		}
 	}
-
 	prompt := fmt.Sprintf(promptTemplate, strings.TrimSpace(item.Text))
+	lockKey := sessionID
+	if lockKey == "" {
+		if item.Lane == LaneWork {
+			lockKey = "work:" + r.workSessionPath() + ":" + item.ID
+		} else {
+			lockKey = "chat:" + r.chatSessionPath() + ":" + item.ID
+		}
+	}
+	unlock := r.gate.lock(lockKey)
 	stdout, stderr, err := r.runner.Run(taskCtx, prompt, sessionID)
-	if sessionID == "" && r.session != nil {
-		if id := parseSessionID(stdout); id != "" {
-			if serr := r.session.Set(id); serr != nil {
-				r.log.Error("session save failed: %v", serr)
-			} else {
-				r.log.Info("session saved id=%s", id)
+	unlock()
+	if sessionID == "" {
+		if item.Lane == LaneWork {
+			if r.workSession != nil {
+				if id := parseSessionID(stdout); id != "" {
+					if serr := r.workSession.Set(id); serr != nil {
+						r.log.Error("session save failed: %v", serr)
+					} else {
+						r.log.Info("session saved id=%s", id)
+					}
+				}
+			}
+		} else {
+			if r.session != nil {
+				if id := parseSessionID(stdout); id != "" {
+					if serr := r.session.Set(id); serr != nil {
+						r.log.Error("session save failed: %v", serr)
+					} else {
+						r.log.Info("session saved id=%s", id)
+					}
+				}
 			}
 		}
 	}
@@ -404,6 +500,20 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 }
 
 // pickRandom mengembalikan satu pesan acak dari pool (kosong jika pool kosong).
+func (r *Relay) chatSessionPath() string {
+	if r != nil && r.session != nil {
+		return r.session.Path()
+	}
+	return ""
+}
+
+func (r *Relay) workSessionPath() string {
+	if r != nil && r.workSession != nil {
+		return r.workSession.Path()
+	}
+	return r.cfg.WorkSessionFile
+}
+
 func pickRandom(messages []string) string {
 	pool := make([]string, 0, len(messages))
 	for _, m := range messages {
