@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -476,12 +477,51 @@ func parseSessionID(stdout string) string {
 	return ""
 }
 
+var thinkingRe = regexp.MustCompile(`(?s)<think(?:ing)?>.*?</think(?:ing)?>`)
+
+var (
+	thinkingClosers = []string{"</thinking>", "</think>"}
+	thinkingOpeners = []string{"<thinking>", "<think>"}
+)
+
+// stripReasoning membuang blok/tag reasoning yang kadang ikut tercampur di dalam
+// part teks (mis. "</thinking>" atau "</think>" nyasar), supaya yang terkirim
+// hanya balasan asli.
+func stripReasoning(s string) string {
+	if !strings.Contains(s, "think") {
+		return s
+	}
+	s = thinkingRe.ReplaceAllString(s, "")
+	// Tag penutup tanpa pembuka: ambil teks setelah kemunculan terakhir.
+	best, tagLen := -1, 0
+	for _, tag := range thinkingClosers {
+		if i := strings.LastIndex(s, tag); i > best {
+			best, tagLen = i, len(tag)
+		}
+	}
+	if best >= 0 {
+		s = s[best+tagLen:]
+	}
+	// Tag pembuka tanpa penutup: buang dari kemunculan pertama sampai akhir.
+	best, tagLen = -1, 0
+	for _, tag := range thinkingOpeners {
+		if i := strings.Index(s, tag); i >= 0 && (best < 0 || i < best) {
+			best, tagLen = i, len(tag)
+		}
+	}
+	if best >= 0 {
+		s = s[:best]
+	}
+	return s
+}
+
 // extractReply pulls the agent's answer out of NDJSON stdout. It never panics.
 func extractReply(stdout string) (result string) {
 	defer func() {
 		if recover() != nil {
 			result = ""
 		}
+		result = strings.TrimSpace(stripReasoning(result))
 	}()
 	var parts []string
 	var fallbacks []string

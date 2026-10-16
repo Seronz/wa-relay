@@ -447,6 +447,15 @@ func TestExtractReply(t *testing.T) {
 		{"empty", "", ""},
 		{"only invalid json", "{not json}\nstill not json\n", "still not json"},
 		{"text type without part text falls back", `{"type":"text","part":{}}` + "\n" + `{"type":"log","text":"lain"}`, "lain"},
+		{"thinking inline", `{"type":"text","part":{"text":"<thinking>plan</thinking>Halo sayang"}}`, "Halo sayang"},
+		{
+			"thinking-only part then reply",
+			`{"type":"text","part":{"text":"reasoning panjang</thinking>"}}` + "\n" +
+				`{"type":"text","part":{"text":"<thinking>lagi</thinking>jawaban asli"}}`,
+			"jawaban asli",
+		},
+		{"no thinking unchanged", `{"type":"text","part":{"text":"biasa aja"}}`, "biasa aja"},
+		{"unterminated thinking", `{"type":"text","part":{"text":"<thinking>belum kelar"}}`, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
