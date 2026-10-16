@@ -58,6 +58,7 @@ func newTestRelay(t *testing.T, cfg *Config, runner TaskRunner, sender Sender) *
 		workQueue:   make(chan taskItem, 16),
 		queue:       make(chan taskItem, 16),
 		runner:      runner,
+		delegations: LoadDelegationStore(filepath.Join(t.TempDir(), "delegations.json"), time.Minute),
 		sender:      sender,
 	}
 }
@@ -641,6 +642,227 @@ func TestWorkerFastTaskSendsNoAck(t *testing.T) {
 	got := sender.messages()
 	if len(got) != 1 || got[0] != "jawaban" {
 		t.Fatalf("sent = %v, want [jawaban] (task cepat tidak boleh kirim ack)", got)
+	}
+}
+
+type recordingRunner struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (r *recordingRunner) Run(context.Context, string, string) (string, string, error) {
+	r.mu.Lock()
+	r.n++
+	r.mu.Unlock()
+	return `{"type":"text","part":{"text":"ok"}}`, "", nil
+}
+
+func (r *recordingRunner) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.n
+}
+
+func TestWorkLaneUsesWorkRunner(t *testing.T) {
+	cfg := testConfig(t)
+	chatRunner := &recordingRunner{}
+	workRunner := &recordingRunner{}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, chatRunner, sender)
+	r.SetWorkRunner(workRunner)
+	chat := "6281234567890@s.whatsapp.net"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Proposal pakai chat runner (stepi), bukan work runner.
+	r.handleMessage(ctx, taskItem{ID: "w1", Text: "coding", Lane: LaneWork, Chat: chat})
+	deadline := time.After(time.Second)
+	for chatRunner.count()+workRunner.count() < 1 {
+		select {
+		case <-deadline:
+			t.Fatalf("runner tidak dipanggil chat=%d work=%d", chatRunner.count(), workRunner.count())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if chatRunner.count() != 1 || workRunner.count() != 0 {
+		t.Fatalf("chat=%d work=%d, mau chat=1 work=0 (proposal lewat stepi)", chatRunner.count(), workRunner.count())
+	}
+
+	// Konfirmasi bos -> work runner dipakai (build + rangkuman lewat stepi).
+	sender.sent = nil
+	r.handleMessage(ctx, taskItem{ID: "c1", Text: "setuju", Lane: LaneChat, Chat: chat})
+	deadline = time.After(time.Second)
+	for chatRunner.count()+workRunner.count() < 3 {
+		select {
+		case <-deadline:
+			t.Fatalf("delegasi tidak dieksekusi chat=%d work=%d", chatRunner.count(), workRunner.count())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if chatRunner.count() != 2 || workRunner.count() != 1 {
+		t.Fatalf("chat=%d work=%d, mau chat=2 work=1", chatRunner.count(), workRunner.count())
+	}
+}
+
+func TestWorkHeavyTaskDoesNotBlockChat(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.NumWorkers = 1
+	cfg.ChatWorkers = 1
+	chatRunner := &stubRunner{stdout: `{"type":"text","part":{"text":"pong"}}`}
+	workRunner := &poolRunner{release: make(chan struct{})}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, chatRunner, sender)
+	r.SetWorkRunner(workRunner)
+	chat := "6281234567890@s.whatsapp.net"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.StartWorkers(ctx)
+
+	// Tugas berat: proposal cepat (chat runner), tidak nunggu build.
+	r.workQueue <- taskItem{ID: "w1", Text: "buat kode", Lane: LaneWork, Chat: chat}
+	deadline := time.After(2 * time.Second)
+	for len(sender.messages()) < 1 {
+		select {
+		case <-deadline:
+			t.Fatal("proposal lambat")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if len(sender.messages()) != 1 || sender.messages()[0] != "pong" {
+		t.Fatalf("sent = %v, want [pong]", sender.messages())
+	}
+
+	// Konfirmasi -> build diblokir (poolRunner), tapi chat masih balas cepat.
+	// Sambil build diblokir belum boleh ada balasan baru.
+	sender.sent = nil
+	r.handleMessage(ctx, taskItem{ID: "c2", Text: "setuju", Lane: LaneChat, Chat: chat})
+	if len(sender.messages()) != 0 {
+		t.Fatalf("build masih diblokir tapi sudah ada balasan: %v", sender.messages())
+	}
+	r.chatQueue <- taskItem{ID: "c3", Text: "halo", Lane: LaneChat, Chat: chat}
+	deadline = time.After(2 * time.Second)
+	for len(sender.messages()) < 1 {
+		select {
+		case <-deadline:
+			t.Fatal("chat diblokir sambil build jalan")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	got := sender.messages()
+	if len(got) != 1 || got[0] != "pong" {
+		t.Fatalf("sent = %v, want [pong]", got)
+	}
+	close(workRunner.release)
+}
+
+type echoRunner struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (e *echoRunner) Run(_ context.Context, prompt string, _ string) (string, string, error) {
+	e.mu.Lock()
+	e.calls = append(e.calls, prompt)
+	n := len(e.calls)
+	e.mu.Unlock()
+	switch n {
+	case 1:
+		return `{"type":"text","part":{"text":"noted bos, aku rangkumin requirement: 1, 2, dst. Aku delegasikan tugas ini ke tim teknis, bos setuju?"}}`, "", nil
+	case 2:
+		return `{"type":"text","part":{"text":"kode sudah selesai dikerjakan tim teknis"}}`, "", nil
+	case 3:
+		return `{"type":"text","part":{"text":"siap bos, fitur X sudah selesai dan siap dipakai"}}`, "", nil
+	}
+	return `{"type":"text","part":{"text":"ok"}}`, "", nil
+}
+
+func (e *echoRunner) nth(i int) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if i < 0 || i >= len(e.calls) {
+		return ""
+	}
+	return e.calls[i]
+}
+
+func TestDelegationDikonfirmasiBos(t *testing.T) {
+	cfg := testConfig(t)
+	runner := &echoRunner{}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, runner, sender)
+	r.SetWorkRunner(runner)
+	chat := "6281234567890@s.whatsapp.net"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 1. Tugas berat: stepi usulkan delegasi + minta konfirmasi.
+	r.handleMessage(ctx, taskItem{ID: "w1", Text: "buat fitur X", Lane: LaneWork, Chat: chat})
+	if got := sender.messages(); len(got) != 1 || !strings.Contains(got[0], "bos setuju") {
+		t.Fatalf("proposal = %v, ingin ada konfirmasi ke bos", got)
+	}
+
+	// 2. Bos setuju: build + rangkuman di latar belakang.
+	sender.sent = nil
+	r.handleMessage(ctx, taskItem{ID: "c1", Text: "setuju", Lane: LaneChat, Chat: chat})
+
+	deadline := time.After(2 * time.Second)
+	for len(sender.messages()) < 1 {
+		select {
+		case <-deadline:
+			t.Fatal("delegasi tidak dieksekusi setelah konfirmasi")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	final := sender.messages()
+	if len(final) != 1 || !strings.Contains(final[0], "selesai") {
+		t.Fatalf("final = %v, ingin rangkuman selesai", final)
+	}
+	if got := runner.nth(0); !strings.Contains(got, "Ringkaskan requirement") {
+		t.Fatalf("panggilan ke-1 bukan proposal: %q", got)
+	}
+	if got := runner.nth(1); !strings.Contains(got, "Selesaikan sebaik-baiknya") {
+		t.Fatalf("panggilan ke-2 bukan build: %q", got)
+	}
+	if got := runner.nth(2); !strings.Contains(got, "Rangkum hasilnya") {
+		t.Fatalf("panggilan ke-3 bukan rangkuman: %q", got)
+	}
+}
+
+func TestDelegationBukanKonfirmasiDibatalkan(t *testing.T) {
+	cfg := testConfig(t)
+	runner := &echoRunner{}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, runner, sender)
+	r.SetWorkRunner(runner)
+	chat := "6281234567890@s.whatsapp.net"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r.handleMessage(ctx, taskItem{ID: "w1", Text: "buat fitur X", Lane: LaneWork, Chat: chat})
+
+	// Balasan non-konfirmasi sambil pending: batalin delegasi, obrolan biasa.
+	r.handleMessage(ctx, taskItem{ID: "c2", Text: "halo apa kabar", Lane: LaneChat, Chat: chat})
+
+	// Tugas berat baru: usul lagi, jangan langsung build.
+	r.handleMessage(ctx, taskItem{ID: "w3", Text: "buat fitur Y", Lane: LaneWork, Chat: chat})
+
+	if got := runner.nth(0); !strings.Contains(got, "Ringkaskan requirement") {
+		t.Fatalf("panggilan ke-1 bukan proposal: %q", got)
+	}
+	if got := runner.nth(1); !strings.Contains(got, "Balas sebagai dirimu sendiri") {
+		t.Fatalf("panggilan ke-2 bukan chat biasa: %q", got)
+	}
+	if got := runner.nth(2); !strings.Contains(got, "Ringkaskan requirement") {
+		t.Fatalf("panggilan ke-3 bukan proposal: %q", got)
+	}
+	for i := 0; i < len(runner.calls); i++ {
+		if strings.Contains(runner.calls[i], "Selesaikan sebaik-baiknya") {
+			t.Fatalf("build seharusnya belum dijalankan: panggilan %d = %q", i+1, runner.calls[i])
+		}
 	}
 }
 

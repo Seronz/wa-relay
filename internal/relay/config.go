@@ -60,6 +60,25 @@ type Config struct {
 	// terpisah tersebut (aman dari sesi chat, tetap diserialisasi gate per-sesi).
 	WorkSessionFile string `json:"work_session_file"`
 
+	// SessionIdleSeconds, SessionMaxAgeSeconds, dan SessionMaxTurns mengatur
+	// rollover sesi (lihat SessionRollPolicy). Sesi yang nganggur lebih lama,
+	// umurnya melebihi batas, atau sudah dipakai lebih dari sekian pesan akan
+	// dilepas supaya konteks tidak tumbuh tanpa batas: pesan berikutnya mulai
+	// sesi baru, sesi lama tetap ada di DB (tercatat di prev_id).
+	// 0 berarti aturan tersebut dimatikan.
+	SessionIdleSeconds   int `json:"session_idle_seconds"`
+	SessionMaxAgeSeconds int `json:"session_max_age_seconds"`
+	SessionMaxTurns      int `json:"session_max_turns"`
+
+	// WorkAgent adalah agent opencode yang mengerjakan lane work (tugas
+	// teknis), supaya tidak memakai persona chat (Agent). Kosong -> Agent.
+	// Default "build".
+	WorkAgent string `json:"work_agent"`
+
+	// DelegationTTLSeconds adalah batas waktu delegasi pending menunggu
+	// konfirmasi bos sebelum kadaluarsa. Default 1800 (30 menit).
+	DelegationTTLSeconds int `json:"delegation_ttl_seconds"`
+
 	heavyOnce sync.Once
 	heavyRe   *regexp.Regexp
 
@@ -76,6 +95,37 @@ func (c *Config) Timeout() time.Duration {
 		s = 480
 	}
 	return time.Duration(s) * time.Second
+}
+
+// SessionRollPolicy menerjemahkan config jadi kebijakan rollover sesi. Nilai
+// config 0 berarti aturan itu dimatikan (RollPolicy juga memakai 0 = mati).
+func (c *Config) SessionRollPolicy() RollPolicy {
+	p := RollPolicy{MaxTurns: c.SessionMaxTurns}
+	if c.SessionIdleSeconds > 0 {
+		p.Idle = time.Duration(c.SessionIdleSeconds) * time.Second
+	}
+	if c.SessionMaxAgeSeconds > 0 {
+		p.MaxAge = time.Duration(c.SessionMaxAgeSeconds) * time.Second
+	}
+	return p
+}
+
+// WorkAgentName mengembalikan agent untuk lane work: work_agent bila diset,
+// selainnya Agent (persona chat).
+func (c *Config) WorkAgentName() string {
+	if c.WorkAgent != "" {
+		return c.WorkAgent
+	}
+	return c.Agent
+}
+
+// DelegationTTL mengembalikan batas waktu menunggu konfirmasi bos sebelum
+// delegasi kadaluarsa (default 30 menit).
+func (c *Config) DelegationTTL() time.Duration {
+	if c.DelegationTTLSeconds <= 0 {
+		return time.Duration(defaultDelegationTTLSeconds) * time.Second
+	}
+	return time.Duration(c.DelegationTTLSeconds) * time.Second
 }
 
 // HeavyPattern mengompilasi regex kata kunci tugas berat (default + config)
@@ -135,6 +185,12 @@ func LoadConfig(path string) (*Config, error) {
 		LightMaxLen:    defaultLightMaxLen,
 		TimeoutSeconds: 900,
 		MarkRead:       true,
+
+		SessionIdleSeconds:   defaultSessionIdleSeconds,
+		SessionMaxAgeSeconds: defaultSessionMaxAgeSeconds,
+		SessionMaxTurns:      defaultSessionMaxTurns,
+		WorkAgent:            defaultWorkAgent,
+		DelegationTTLSeconds: defaultDelegationTTLSeconds,
 	}
 	if err := json.Unmarshal(raw, cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)

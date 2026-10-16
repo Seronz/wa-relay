@@ -117,12 +117,18 @@ func (r *Relay) handleHook(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	item := taskItem{ID: msg.ID, Text: strings.TrimSpace(msg.Text), Chat: chatTarget(r.cfg, &msg), Lane: Classify(r.cfg, msg.Text)}
+	// Target antrean menurut lane, supaya tugas berat tidak pernah macet di
+	// antrean chat dan sebaliknya. `queue` (legacy) tetap jadi fallback.
+	var target chan taskItem
+	switch item.Lane {
+	case LaneWork:
+		target = r.workQueue
+	default:
+		target = r.chatQueue
+	}
 	select {
-	case r.chatQueue <- item:
-		r.log.Info("queued id=%s len=%d lane=chat", item.ID, len(item.Text))
-		respond(w, http.StatusOK, map[string]any{"ok": true, "queued": true})
-	case r.workQueue <- item:
-		r.log.Info("queued id=%s len=%d lane=work", item.ID, len(item.Text))
+	case target <- item:
+		r.log.Info("queued id=%s len=%d lane=%s", item.ID, len(item.Text), item.Lane)
 		respond(w, http.StatusOK, map[string]any{"ok": true, "queued": true})
 	case r.queue <- item:
 		r.log.Info("queued id=%s len=%d lane=unified", item.ID, len(item.Text))
