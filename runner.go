@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"sort"
@@ -93,8 +94,9 @@ type taskItem struct {
 }
 
 // TaskRunner runs the agent for a prompt and returns raw stdout/stderr.
+// sessionID, bila tidak kosong, melanjutkan sesi opencode yang sama.
 type TaskRunner interface {
-	Run(ctx context.Context, prompt string) (stdout string, stderr string, err error)
+	Run(ctx context.Context, prompt, sessionID string) (stdout string, stderr string, err error)
 }
 
 type ExecRunner struct {
@@ -106,18 +108,21 @@ type ExecRunner struct {
 }
 
 // args builds the `opencode run` argument list. Exposed for testing.
-func (r *ExecRunner) args(prompt string) []string {
+func (r *ExecRunner) args(prompt, sessionID string) []string {
 	args := []string{"run", "--dir", r.Workdir, "--format", "json", "--title", "wa-relay"}
 	if r.Agent != "" {
 		args = append(args, "--agent", r.Agent)
 	}
+	if sessionID != "" {
+		args = append(args, "--session", sessionID)
+	}
 	return append(args, prompt)
 }
 
-func (r *ExecRunner) Run(ctx context.Context, prompt string) (string, string, error) {
+func (r *ExecRunner) Run(ctx context.Context, prompt, sessionID string) (string, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, r.Bin, r.args(prompt)...)
+	cmd := exec.CommandContext(ctx, r.Bin, r.args(prompt, sessionID)...)
 	cmd.Dir = r.BaseDir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
@@ -162,12 +167,13 @@ func (s *WacliSender) Send(text string) error {
 }
 
 type Relay struct {
-	cfg    *Config
-	log    *Logger
-	seen   *SeenStore
-	queue  chan taskItem
-	runner TaskRunner
-	sender Sender
+	cfg     *Config
+	log     *Logger
+	seen    *SeenStore
+	session *SessionStore
+	queue   chan taskItem
+	runner  TaskRunner
+	sender  Sender
 }
 
 func (r *Relay) worker(ctx context.Context) {
@@ -192,8 +198,40 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 		r.log.Info("task done id=%s fast-path duration=%.1fs", item.ID, time.Since(start).Seconds())
 		return
 	}
+	// "/reset" menghapus sesi, jadi pesan berikutnya mulai obrolan baru.
+	if strings.TrimSpace(item.Text) == "/reset" {
+		if r.session != nil {
+			if err := r.session.Set(""); err != nil {
+				r.log.Error("session reset failed: %v", err)
+			}
+		}
+		r.sendChunked("oke, kita mulai dari awal ya 😊")
+		r.log.Info("task done id=%s reset duration=%.1fs", item.ID, time.Since(start).Seconds())
+		return
+	}
+	// Ack pertama & follow-up hanya dikirim kalau task masih jalan (lihat
+	// sendScheduled). Task yang cepat selesai cukup dapat jawaban langsung.
+	taskCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go r.sendScheduled(taskCtx, item)
+
+	// Lanjutkan sesi opencode yang sama supaya agent ingat obrolan sebelumnya.
+	sessionID := ""
+	if r.session != nil {
+		sessionID = r.session.ID()
+	}
+
 	prompt := fmt.Sprintf(promptTemplate, strings.TrimSpace(item.Text))
-	stdout, stderr, err := r.runner.Run(ctx, prompt)
+	stdout, stderr, err := r.runner.Run(taskCtx, prompt, sessionID)
+	if sessionID == "" && r.session != nil {
+		if id := parseSessionID(stdout); id != "" {
+			if serr := r.session.Set(id); serr != nil {
+				r.log.Error("session save failed: %v", serr)
+			} else {
+				r.log.Info("session saved id=%s", id)
+			}
+		}
+	}
 	if err != nil {
 		r.log.Error("opencode failed: %v (stderr %dB)", err, len(stderr))
 		r.sendChunked(errorNote(err, stderr))
@@ -204,6 +242,74 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 	reply := extractReply(stdout)
 	r.sendChunked(reply)
 	r.log.Info("task done id=%s reply_len=%d duration=%.1fs", item.ID, len(reply), time.Since(start).Seconds())
+}
+
+// pickRandom mengembalikan satu pesan acak dari pool (kosong jika pool kosong).
+func pickRandom(messages []string) string {
+	pool := make([]string, 0, len(messages))
+	for _, m := range messages {
+		if strings.TrimSpace(m) != "" {
+			pool = append(pool, m)
+		}
+	}
+	switch len(pool) {
+	case 0:
+		return ""
+	case 1:
+		return pool[0]
+	default:
+		return pool[rand.Intn(len(pool))]
+	}
+}
+
+// sendScheduled mengirim ack pertama (setelah ack_delay_seconds) dan follow-up
+// berikutnya, tapi hanya selama task belum selesai. after_seconds dihitung dari
+// awal task, dan berhenti begitu ctx dibatalkan.
+func (r *Relay) sendScheduled(ctx context.Context, item taskItem) {
+	start := time.Now()
+	if r.cfg.AckDelaySeconds > 0 && len(r.cfg.AckMessages) > 0 {
+		if !waitUntil(ctx, start, r.cfg.AckDelaySeconds) {
+			return
+		}
+		r.deliver(item, "ack", r.cfg.AckDelaySeconds, pickRandom(r.cfg.AckMessages))
+	}
+	for _, fu := range r.cfg.AckFollowups {
+		if fu.AfterSeconds <= 0 {
+			continue
+		}
+		if !waitUntil(ctx, start, fu.AfterSeconds) {
+			return
+		}
+		r.deliver(item, "followup", fu.AfterSeconds, pickRandom(fu.Messages))
+	}
+}
+
+// waitUntil menunggu sampai start+afterSeconds, atau berhenti (return false)
+// kalau ctx dibatalkan lebih dulu.
+func waitUntil(ctx context.Context, start time.Time, afterSeconds int) bool {
+	wait := time.Until(start.Add(time.Duration(afterSeconds) * time.Second))
+	if wait < 0 {
+		wait = 0
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (r *Relay) deliver(item taskItem, kind string, afterSeconds int, msg string) {
+	if msg == "" {
+		return
+	}
+	if err := r.sender.Send(msg); err != nil {
+		r.log.Error("%s send failed id=%s after=%ds err=%v", kind, item.ID, afterSeconds, err)
+		return
+	}
+	r.log.Info("%s sent id=%s after=%ds", kind, item.ID, afterSeconds)
 }
 
 func errorNote(err error, stderr string) string {
@@ -262,6 +368,23 @@ func chunkText(text string, size int) []string {
 		out = append(out, string(runes[i:end]))
 	}
 	return out
+}
+
+// parseSessionID mengambil sessionID dari event NDJSON pertama yang memuatnya.
+func parseSessionID(stdout string) string {
+	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) < 2 || line[0] != '{' {
+			continue
+		}
+		var ev struct {
+			SessionID string `json:"sessionID"`
+		}
+		if json.Unmarshal([]byte(line), &ev) == nil && ev.SessionID != "" {
+			return ev.SessionID
+		}
+	}
+	return ""
 }
 
 // extractReply pulls the agent's answer out of NDJSON stdout. It never panics.

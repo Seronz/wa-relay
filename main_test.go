@@ -47,12 +47,13 @@ func newTestRelay(t *testing.T, cfg *Config, runner TaskRunner, sender Sender) *
 	}
 	t.Cleanup(log.Close)
 	return &Relay{
-		cfg:    cfg,
-		log:    log,
-		seen:   LoadSeen(filepath.Join(t.TempDir(), "seen.json"), maxSeen),
-		queue:  make(chan taskItem, 16),
-		runner: runner,
-		sender: sender,
+		cfg:     cfg,
+		log:     log,
+		seen:    LoadSeen(filepath.Join(t.TempDir(), "seen.json"), maxSeen),
+		session: LoadSession(filepath.Join(t.TempDir(), "session.json")),
+		queue:   make(chan taskItem, 16),
+		runner:  runner,
+		sender:  sender,
 	}
 }
 
@@ -79,20 +80,27 @@ func (s *stubSender) messages() []string {
 }
 
 type stubRunner struct {
-	mu     sync.Mutex
-	stdout string
-	stderr string
-	err    error
-	calls  int
-	prompt string
+	mu       sync.Mutex
+	stdout   string
+	stderr   string
+	err      error
+	calls    int
+	prompt   string
+	delay    time.Duration
+	sessions []string
 }
 
-func (s *stubRunner) Run(_ context.Context, prompt string) (string, string, error) {
+func (s *stubRunner) Run(_ context.Context, prompt, sessionID string) (string, string, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.calls++
 	s.prompt = prompt
-	return s.stdout, s.stderr, s.err
+	s.sessions = append(s.sessions, sessionID)
+	stdout, stderr, err, delay := s.stdout, s.stderr, s.err, s.delay
+	s.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	return stdout, stderr, err
 }
 
 func signBody(secret string, body []byte) string {
@@ -423,6 +431,135 @@ func TestWorkerPingFastPath(t *testing.T) {
 	}
 }
 
+func TestWorkerFastTaskSendsNoAck(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.AckDelaySeconds = 300
+	cfg.AckMessages = []string{"lagi diproses"}
+	runner := &stubRunner{stdout: `{"type":"text","part":{"text":"jawaban"}}`}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, runner, sender)
+
+	r.handleMessage(context.Background(), taskItem{ID: "a", Text: "halo"})
+	got := sender.messages()
+	if len(got) != 1 || got[0] != "jawaban" {
+		t.Fatalf("sent = %v, want [jawaban] (task cepat tidak boleh kirim ack)", got)
+	}
+}
+
+func TestWorkerAckSentOnlyWhenSlow(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.AckDelaySeconds = 1
+	cfg.AckMessages = []string{"lagi diproses"}
+	runner := &stubRunner{stdout: `{"type":"text","part":{"text":"jawaban"}}`, delay: 1500 * time.Millisecond}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, runner, sender)
+
+	r.handleMessage(context.Background(), taskItem{ID: "b", Text: "halo"})
+	got := sender.messages()
+	if len(got) != 2 || got[0] != "lagi diproses" || got[1] != "jawaban" {
+		t.Fatalf("sent = %v, want [lagi diproses jawaban]", got)
+	}
+}
+
+func TestWorkerPingSkipsAck(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.AckDelaySeconds = 1
+	cfg.AckMessages = []string{"lagi diproses"}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, &stubRunner{}, sender)
+
+	r.handleMessage(context.Background(), taskItem{ID: "p", Text: "ping"})
+	got := sender.messages()
+	if len(got) != 1 || got[0] != "pong" {
+		t.Fatalf("sent = %v, want [pong]", got)
+	}
+}
+
+func TestPickRandom(t *testing.T) {
+	if got := pickRandom(nil); got != "" {
+		t.Fatalf("pickRandom(nil) = %q, want empty", got)
+	}
+	if got := pickRandom([]string{"  ", ""}); got != "" {
+		t.Fatalf("pickRandom(blank) = %q, want empty", got)
+	}
+	if got := pickRandom([]string{"only"}); got != "only" {
+		t.Fatalf("pickRandom(single) = %q, want only", got)
+	}
+	pool := []string{"a", "b", "c"}
+	for i := 0; i < 20; i++ {
+		if got := pickRandom(pool); got != "a" && got != "b" && got != "c" {
+			t.Fatalf("pickRandom out of pool: %q", got)
+		}
+	}
+	// Kosong di tengah pool harus dilewati.
+	if got := pickRandom([]string{"", "x", "  "}); got != "x" {
+		t.Fatalf("pickRandom skips blank = %q, want x", got)
+	}
+}
+
+func TestSendScheduledFiresAckThenStopsOnCancel(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.AckDelaySeconds = 1
+	cfg.AckMessages = []string{"ack"}
+	cfg.AckFollowups = []AckFollowup{{AfterSeconds: 2, Messages: []string{"masih diproses"}}}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, &stubRunner{}, sender)
+
+	r.sendScheduled(context.Background(), taskItem{ID: "s"})
+	got := sender.messages()
+	if len(got) != 2 || got[0] != "ack" || got[1] != "masih diproses" {
+		t.Fatalf("sent = %v, want [ack masih diproses]", got)
+	}
+
+	// Jika context sudah dibatalkan, ack/follow-up tidak boleh terkirim.
+	sender2 := &stubSender{}
+	r2 := newTestRelay(t, cfg, &stubRunner{}, sender2)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r2.sendScheduled(ctx, taskItem{ID: "s2"})
+	if got := sender2.messages(); len(got) != 0 {
+		t.Fatalf("sent = %v, want none after cancel", got)
+	}
+}
+
+func TestSendScheduledSkipsNonPositive(t *testing.T) {
+	cfg := testConfig(t)
+	// ack_delay 0 => tidak ada ack; follow-up 0/negatif dilewati.
+	cfg.AckDelaySeconds = 0
+	cfg.AckMessages = []string{"ack"}
+	cfg.AckFollowups = []AckFollowup{
+		{AfterSeconds: 0, Messages: []string{"nope"}},
+		{AfterSeconds: -5, Messages: []string{"nope2"}},
+	}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, &stubRunner{}, sender)
+	r.sendScheduled(context.Background(), taskItem{ID: "s"})
+	if got := sender.messages(); len(got) != 0 {
+		t.Fatalf("sent = %v, want none", got)
+	}
+}
+
+func TestWorkerResetClearsSession(t *testing.T) {
+	sender := &stubSender{}
+	runner := &stubRunner{stdout: `{"type":"text","part":{"text":"jawaban"}}`}
+	r := newTestRelay(t, testConfig(t), runner, sender)
+	if err := r.session.Set("ses_old"); err != nil {
+		t.Fatal(err)
+	}
+
+	r.handleMessage(context.Background(), taskItem{ID: "r1", Text: " /reset "})
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want 0 (reset tidak memanggil agent)", runner.calls)
+	}
+	if got := r.session.ID(); got != "" {
+		t.Fatalf("session id = %q, want empty", got)
+	}
+	msgs := sender.messages()
+	if len(msgs) != 1 || !strings.Contains(msgs[0], "mulai") {
+		t.Fatalf("sent = %v, want a reset confirmation", msgs)
+	}
+}
+
 func TestWorkerAgentReply(t *testing.T) {
 	runner := &stubRunner{stdout: `{"type":"text","part":{"text":"halo dari agent"}}`}
 	sender := &stubSender{}
@@ -476,17 +613,62 @@ func TestWorkerLongReplyIsChunked(t *testing.T) {
 	}
 }
 
-func TestExecRunnerArgsIncludesAgent(t *testing.T) {
-	withAgent := strings.Join((&ExecRunner{Workdir: "/w", Agent: "stepi"}).args("halo"), " ")
+func TestExecRunnerArgs(t *testing.T) {
+	withAgent := strings.Join((&ExecRunner{Workdir: "/w", Agent: "stepi"}).args("halo", ""), " ")
 	wantWith := "run --dir /w --format json --title wa-relay --agent stepi halo"
 	if withAgent != wantWith {
 		t.Fatalf("args = %q, want %q", withAgent, wantWith)
 	}
 
-	withoutAgent := strings.Join((&ExecRunner{Workdir: "/w"}).args("halo"), " ")
+	withSession := strings.Join((&ExecRunner{Workdir: "/w", Agent: "stepi"}).args("halo", "ses_1"), " ")
+	wantSession := "run --dir /w --format json --title wa-relay --agent stepi --session ses_1 halo"
+	if withSession != wantSession {
+		t.Fatalf("args = %q, want %q", withSession, wantSession)
+	}
+
+	withoutAgent := strings.Join((&ExecRunner{Workdir: "/w"}).args("halo", ""), " ")
 	wantWithout := "run --dir /w --format json --title wa-relay halo"
 	if withoutAgent != wantWithout {
 		t.Fatalf("args = %q, want %q", withoutAgent, wantWithout)
+	}
+}
+
+func TestParseSessionID(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"first event", `{"type":"step_start","sessionID":"ses_abc"}` + "\n" + `{"type":"text","sessionID":"ses_abc"}`, "ses_abc"},
+		{"later event only", `{"type":"text","sessionID":"ses_xyz"}`, "ses_xyz"},
+		{"no session field", `{"type":"text"}`, ""},
+		{"not json", "bukan json\n", ""},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseSessionID(tc.in); got != tc.want {
+				t.Fatalf("parseSessionID() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRelayPersistsAndReusesSession(t *testing.T) {
+	cfg := testConfig(t)
+	runner := &stubRunner{stdout: `{"type":"step_start","sessionID":"ses_test"}` + "\n" + `{"type":"text","part":{"text":"halo"}}`}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, runner, sender)
+
+	r.handleMessage(context.Background(), taskItem{ID: "1", Text: "hai"})
+	if got := r.session.ID(); got != "ses_test" {
+		t.Fatalf("session id = %q, want ses_test", got)
+	}
+	if got := LoadSession(r.session.path).ID(); got != "ses_test" {
+		t.Fatalf("persisted session = %q, want ses_test", got)
+	}
+
+	r.handleMessage(context.Background(), taskItem{ID: "2", Text: "lanjut"})
+	if len(runner.sessions) != 2 || runner.sessions[0] != "" || runner.sessions[1] != "ses_test" {
+		t.Fatalf("runner sessions = %v, want [\"\" ses_test]", runner.sessions)
 	}
 }
 
@@ -497,7 +679,7 @@ func TestExecRunnerCapturesStdout(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := &ExecRunner{Bin: script, Workdir: dir, BaseDir: dir, Timeout: 5 * time.Second}
-	stdout, _, err := runner.Run(context.Background(), "hi")
+	stdout, _, err := runner.Run(context.Background(), "hi", "")
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -508,7 +690,7 @@ func TestExecRunnerCapturesStdout(t *testing.T) {
 
 func TestExecRunnerNotFound(t *testing.T) {
 	runner := &ExecRunner{Bin: "definitely-not-a-real-binary-xyz", Timeout: time.Second}
-	if _, _, err := runner.Run(context.Background(), "hi"); !errors.Is(err, exec.ErrNotFound) {
+	if _, _, err := runner.Run(context.Background(), "hi", ""); !errors.Is(err, exec.ErrNotFound) {
 		t.Fatalf("err = %v, want exec.ErrNotFound", err)
 	}
 }
@@ -521,7 +703,7 @@ func TestExecRunnerTimeoutKillsProcessGroup(t *testing.T) {
 	}
 	runner := &ExecRunner{Bin: script, Workdir: dir, BaseDir: dir, Timeout: 200 * time.Millisecond}
 	start := time.Now()
-	_, _, err := runner.Run(context.Background(), "hi")
+	_, _, err := runner.Run(context.Background(), "hi", "")
 	elapsed := time.Since(start)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want context.DeadlineExceeded", err)

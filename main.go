@@ -37,14 +37,16 @@ func main() {
 		os.Exit(1)
 	}
 	seen := LoadSeen(filepath.Join(stateDir, "seen.json"), maxSeen)
+	session := LoadSession(filepath.Join(stateDir, "session.json"))
 
 	relay := &Relay{
-		cfg:    cfg,
-		log:    log,
-		seen:   seen,
-		queue:  make(chan taskItem, queueBuffer),
-		runner: &ExecRunner{Bin: cfg.OpencodeBin, Workdir: cfg.Workdir, BaseDir: cfg.BaseDir, Agent: cfg.Agent, Timeout: cfg.Timeout()},
-		sender: &WacliSender{Bin: cfg.WacliBin, Phone: cfg.OwnerPhone},
+		cfg:     cfg,
+		log:     log,
+		seen:    seen,
+		session: session,
+		queue:   make(chan taskItem, queueBuffer),
+		runner:  &ExecRunner{Bin: cfg.OpencodeBin, Workdir: cfg.Workdir, BaseDir: cfg.BaseDir, Agent: cfg.Agent, Timeout: cfg.Timeout()},
+		sender:  &WacliSender{Bin: cfg.WacliBin, Phone: cfg.OwnerPhone},
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

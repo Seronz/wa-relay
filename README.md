@@ -21,7 +21,17 @@ wacli sync --follow  ──webhook──►  wa-relay (Go)  (127.0.0.1:8791/hook
                               parse jawaban agent ──► wacli send text ──► Owner
 ```
 
-Pesan `ping` (case-insensitive) dibalas `pong` langsung tanpa memanggil agent.
+Pesan `ping` (case-insensitive) dibalas `pong` langsung tanpa memanggil agent. Pesan `/reset` menghapus konteks sesi sehingga pesan berikutnya mulai obrolan baru.
+
+### Ingatan sesi (session continuity)
+
+Relay menyimpan `sessionID` opencode di `state/session.json`. Pesan pertama membuat sesi baru
+(`--title wa-relay`), lalu pesan-pesan berikutnya dijalankan dengan `opencode run --session <id>`
+sehingga agent **ingat percakapan sebelumnya** (tidak lagi lupa konteks antar pesan).
+
+- Kirim `/reset` (persis, boleh ada spasi) di WhatsApp untuk menghapus sesi dan mulai dari nol.
+- Hapus manual: `rm state/session.json` lalu restart relay.
+- Catatan: sesi yang terus lanjut akan makin panjang (token makin besar) — pakai `/reset` sesekali.
 
 ## Spesifikasi payload & signature (wacli)
 
@@ -45,8 +55,11 @@ Pesan `ping` (case-insensitive) dibalas `pong` langsung tanpa memanggil agent.
 | `owner_jid` / `owner_phone` | JID & nomor owner (satu-satunya pengirim yang diproses) |
 | `workdir` | `--dir` untuk `opencode run` |
 | `agent` | Nama agent opencode yang menjawab (`--agent`, default `stepi`) |
+| `ack_delay_seconds` | Kirim ack pertama hanya bila task masih jalan melewati detik ini (default 300 = 5 menit); `0` untuk menonaktifkan |
+| `ack_messages` | Pool ack pertama (dipilih acak), dikirim setelah `ack_delay_seconds`; `[]` untuk menonaktifkan |
+| `ack_followups` | Array `{after_seconds, messages}`, pesan susulan bila task belum selesai (default 600s) |
 | `opencode_bin` / `wacli_bin` | Path binary |
-| `timeout_seconds` | Timeout `opencode run` (default 480) |
+| `timeout_seconds` | Timeout `opencode run` (default 900) |
 | `log_file` | Log file relay |
 
 `opencode.json` berisi permission untuk agent yang di-spawn relay: allow read/edit/glob/grep/list, `external_directory` allow-all, bash allow-all tapi **last-match-wins deny** untuk `rm -rf *`, `sudo *`, `git push *`. Longgarkan/ketatkan sesuai kebutuhan.
@@ -98,6 +111,7 @@ dari `config.json` lewat `run-sync.sh`.
 - Setiap webhook diverifikasi HMAC-SHA256; signature salah → 401.
 - Hanya pesan dari `owner_jid`, bukan `FromMe`, bukan grup/channel/status, teks kosong diabaikan.
 - Dedupe by message `ID` (500 terakhir, disimpan di `state/seen.json`).
+- Sesi opencode terakhir disimpan di `state/session.json` (hapus untuk reset).
 - Policy permission agent di `opencode.json` (bisa diketatkan).
 
 ## Mengubah owner / limit
