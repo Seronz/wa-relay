@@ -34,6 +34,9 @@ type Config struct {
 	NumWorkers      int           `json:"num_workers"`
 	TimeoutSeconds  int           `json:"timeout_seconds"`
 	LogFile         string        `json:"log_file"`
+	// MarkRead mengirim read receipt (centang biru) untuk pesan owner yang
+	// diterima. Default true; set false untuk mematikannya.
+	MarkRead bool `json:"mark_read"`
 
 	BaseDir string `json:"-"`
 }
@@ -83,6 +86,7 @@ func LoadConfig(path string) (*Config, error) {
 		WacliBin:       "wacli",
 		NumWorkers:     defaultWorkers,
 		TimeoutSeconds: 900,
+		MarkRead:       true,
 	}
 	if err := json.Unmarshal(raw, cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)

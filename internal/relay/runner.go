@@ -22,6 +22,7 @@ const (
 	queueBuffer     = 256
 	defaultChunk    = 3000
 	sendTimeout     = 120 * time.Second
+	markReadTimeout = 30 * time.Second
 	stderrMaxRune   = 400
 	seenFlushPeriod = 2 * time.Second
 	defaultWorkers  = 3
@@ -225,6 +226,37 @@ func (s *WacliSender) Send(text string) error {
 	return nil
 }
 
+// MarkReader menandai satu chat sebagai sudah dibaca (read receipt).
+type MarkReader interface {
+	MarkRead(chat string) error
+}
+
+type WacliMarkReader struct {
+	Bin string
+}
+
+// args builds the `wacli chats mark-read` argument list. Exposed for testing.
+// Flag --receipts yang mengirim read receipt diserahkan sepenuhnya ke wacli,
+// termasuk soal privasi read receipt milik user.
+func (m *WacliMarkReader) args(chat string) []string {
+	return []string{"chats", "mark-read", "--chat", chat, "--receipts"}
+}
+
+func (m *WacliMarkReader) MarkRead(chat string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), markReadTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, m.Bin, m.args(chat)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		detail := truncateRunes(strings.TrimSpace(string(out)), stderrMaxRune)
+		if detail != "" {
+			return fmt.Errorf("%v: %s", err, detail)
+		}
+		return err
+	}
+	return nil
+}
+
 type Relay struct {
 	cfg     *Config
 	log     *Logger
@@ -233,10 +265,11 @@ type Relay struct {
 	queue   chan taskItem
 	runner  TaskRunner
 	sender  Sender
+	reader  MarkReader
 }
 
 // NewRelay menyusun Relay lengkap dengan antrean dan dependensinya.
-func NewRelay(cfg *Config, log *Logger, seen *SeenStore, session *SessionStore, runner TaskRunner, sender Sender) *Relay {
+func NewRelay(cfg *Config, log *Logger, seen *SeenStore, session *SessionStore, runner TaskRunner, sender Sender, reader MarkReader) *Relay {
 	return &Relay{
 		cfg:     cfg,
 		log:     log,
@@ -245,6 +278,7 @@ func NewRelay(cfg *Config, log *Logger, seen *SeenStore, session *SessionStore, 
 		queue:   make(chan taskItem, queueBuffer),
 		runner:  runner,
 		sender:  sender,
+		reader:  reader,
 	}
 }
 

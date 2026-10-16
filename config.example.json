@@ -33,5 +33,6 @@
   "wacli_bin": "wacli",
   "num_workers": 3,
   "timeout_seconds": 900,
+  "mark_read": true,
   "log_file": "/home/zakaria/projects/wa-relay/relay.log"
 }

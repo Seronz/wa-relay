@@ -81,6 +81,38 @@ func (s *stubSender) messages() []string {
 	return append([]string(nil), s.sent...)
 }
 
+type stubMarkReader struct {
+	mu    sync.Mutex
+	chats []string
+	err   error
+}
+
+func (s *stubMarkReader) MarkRead(chat string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.chats = append(s.chats, chat)
+	return s.err
+}
+
+func (s *stubMarkReader) calls() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.chats...)
+}
+
+// waitMarkReads menunggu mark-read (async) sampai jumlah panggilan tercapai.
+func waitMarkReads(t *testing.T, s *stubMarkReader, want int) []string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := s.calls(); len(got) >= want {
+			return got
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return s.calls()
+}
+
 type stubRunner struct {
 	mu       sync.Mutex
 	stdout   string
@@ -869,5 +901,181 @@ func TestLoggerWritesToBothWhenDifferentTargets(t *testing.T) {
 		if !strings.Contains(string(data), "ke-dua") {
 			t.Fatalf("%s tidak berisi log: %q", p, string(data))
 		}
+	}
+}
+
+func TestWacliMarkReaderArgs(t *testing.T) {
+	got := strings.Join((&WacliMarkReader{Bin: "wacli"}).args("6281234567890@s.whatsapp.net"), " ")
+	want := "chats mark-read --chat 6281234567890@s.whatsapp.net --receipts"
+	if got != want {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestLoadConfigMarkReadDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"owner_jid":"6281234567890@s.whatsapp.net"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.MarkRead {
+		t.Fatal("mark_read harus default true bila tidak diset")
+	}
+
+	if err := os.WriteFile(path, []byte(`{"mark_read":false}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MarkRead {
+		t.Fatal("mark_read:false di config harus dihormati")
+	}
+}
+
+func TestExampleConfigEnablesMarkRead(t *testing.T) {
+	cfg, err := LoadConfig(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatalf("config.example.json tidak bisa dibaca: %v", err)
+	}
+	if !cfg.MarkRead {
+		t.Fatal("config.example.json harus memuat mark_read true")
+	}
+}
+
+func TestHookMarksReadForOwnerMessage(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MarkRead = true
+	r := newTestRelay(t, cfg, &stubRunner{}, &stubSender{})
+	reader := &stubMarkReader{}
+	r.reader = reader
+
+	body, _ := json.Marshal(validPayload())
+	rec := postHook(t, r, body, signBody(cfg.WebhookSecret, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	if got := decodeBody(t, rec)["queued"]; got != true {
+		t.Fatalf("queued = %v, want true", got)
+	}
+
+	got := waitMarkReads(t, reader, 1)
+	if len(got) != 1 || got[0] != cfg.OwnerJID {
+		t.Fatalf("mark-read = %v, want [%s]", got, cfg.OwnerJID)
+	}
+}
+
+func TestHookMarkReadUsesFallbackTarget(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MarkRead = true
+	r := newTestRelay(t, cfg, &stubRunner{}, &stubSender{})
+	reader := &stubMarkReader{}
+	r.reader = reader
+
+	payload := validPayload()
+	payload["Chat"] = ""
+	body, _ := json.Marshal(payload)
+	rec := postHook(t, r, body, signBody(cfg.WebhookSecret, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+
+	got := waitMarkReads(t, reader, 1)
+	if len(got) != 1 || got[0] != payload["SenderJID"] {
+		t.Fatalf("mark-read = %v, want [%v]", got, payload["SenderJID"])
+	}
+}
+
+func TestHookDoesNotMarkReadIgnored(t *testing.T) {
+	cases := []struct {
+		name       string
+		mutate     func(map[string]any)
+		clearOwner bool
+		want       string
+	}{
+		{"event", func(m map[string]any) { m["EventType"] = "receipt" }, false, "event"},
+		{"from me", func(m map[string]any) { m["FromMe"] = true }, false, "fromme"},
+		{"not owner", func(m map[string]any) { m["SenderJID"] = "6289999999999@s.whatsapp.net" }, false, "not-owner"},
+		{"group chat", func(m map[string]any) { m["Chat"] = "1234-5678@g.us"; m["SenderJID"] = "1234-5678@g.us" }, true, "group/status"},
+		{"empty text", func(m map[string]any) { m["Text"] = "" }, false, "empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			cfg.MarkRead = true
+			if tc.clearOwner {
+				cfg.OwnerJID = ""
+			}
+			r := newTestRelay(t, cfg, &stubRunner{}, &stubSender{})
+			reader := &stubMarkReader{}
+			r.reader = reader
+
+			payload := validPayload()
+			tc.mutate(payload)
+			body, _ := json.Marshal(payload)
+			rec := postHook(t, r, body, signBody(cfg.WebhookSecret, body))
+			if got := decodeBody(t, rec)["ignored"]; got != tc.want {
+				t.Fatalf("ignored = %v, want %v", got, tc.want)
+			}
+			time.Sleep(30 * time.Millisecond)
+			if got := reader.calls(); len(got) != 0 {
+				t.Fatalf("mark-read dipanggil untuk pesan ignored: %v", got)
+			}
+		})
+	}
+}
+
+func TestHookDoesNotMarkReadDuplicate(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MarkRead = true
+	r := newTestRelay(t, cfg, &stubRunner{}, &stubSender{})
+	reader := &stubMarkReader{}
+	r.reader = reader
+
+	body, _ := json.Marshal(validPayload())
+	postHook(t, r, body, signBody(cfg.WebhookSecret, body))
+	waitMarkReads(t, reader, 1)
+
+	rec := postHook(t, r, body, signBody(cfg.WebhookSecret, body))
+	if got := decodeBody(t, rec)["ignored"]; got != "duplicate" {
+		t.Fatalf("ignored = %v, want duplicate", got)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if got := reader.calls(); len(got) != 1 {
+		t.Fatalf("mark-read untuk duplikat = %v, want cuma 1", got)
+	}
+}
+
+func TestHookMarkReadDisabledByConfig(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MarkRead = false
+	r := newTestRelay(t, cfg, &stubRunner{}, &stubSender{})
+	reader := &stubMarkReader{}
+	r.reader = reader
+
+	body, _ := json.Marshal(validPayload())
+	rec := postHook(t, r, body, signBody(cfg.WebhookSecret, body))
+	if got := decodeBody(t, rec)["queued"]; got != true {
+		t.Fatalf("queued = %v, want true", got)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := reader.calls(); len(got) != 0 {
+		t.Fatalf("mark-read jalan padahal config off: %v", got)
+	}
+}
+
+func TestMarkReadNilReaderIsSafe(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MarkRead = true
+	r := newTestRelay(t, cfg, &stubRunner{}, &stubSender{})
+
+	body, _ := json.Marshal(validPayload())
+	rec := postHook(t, r, body, signBody(cfg.WebhookSecret, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
 	}
 }

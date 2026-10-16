@@ -46,6 +46,7 @@ func main() {
 		session,
 		&relay.ExecRunner{Bin: cfg.OpencodeBin, Workdir: cfg.Workdir, BaseDir: cfg.BaseDir, Agent: cfg.Agent, Timeout: cfg.Timeout()},
 		&relay.WacliSender{Bin: cfg.WacliBin, Phone: cfg.OwnerPhone},
+		&relay.WacliMarkReader{Bin: cfg.WacliBin},
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
