@@ -3,6 +3,7 @@ config.json
 
 # Binary hasil build (hanya di root, jangan kena folder cmd/wa-relay)
 /wa-relay
+/bin/
 
 # Runtime state: sesi, seen, delegasi. Dibuang/di-reset tiap restart.
 # state/session.json sengaja TIDAK dilanjutkan antar restart (lihat
