@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const promptTemplate = "Pesan WhatsApp dari irza:\n---\n%s\n---\n" +
+const promptTemplate = "Pesan WhatsApp dari bos:\n---\n%s\n---\n" +
 	"Balas sebagai dirimu sendiri, singkat dan natural (bahasa Indonesia santai/gaul). " +
 	"Langsung ke balasan, tanpa proses berpikir, tanpa judul markdown, tanpa tabel, tanpa fence kode."
 
@@ -22,12 +22,25 @@ type AckFollowup struct {
 }
 
 type Config struct {
-	Host            string        `json:"host"`
-	Port            int           `json:"port"`
-	WebhookSecret   string        `json:"webhook_secret"`
-	OwnerJID        string        `json:"owner_jid"`
-	OwnerPhone      string        `json:"owner_phone"`
-	Workdir         string        `json:"workdir"`
+	Host          string `json:"host"`
+	Port          int    `json:"port"`
+	WebhookSecret string `json:"webhook_secret"`
+	OwnerJID      string `json:"owner_jid"`
+	OwnerPhone    string `json:"owner_phone"`
+	Workdir       string `json:"workdir"`
+	// ChatWorkdir adalah working directory untuk stepi (receptionist / lane
+	// chat). Default <workdir>. Dipisah supaya obrolan ringan tidak berbagi
+	// direktori dengan build yang jalan paralel.
+	ChatWorkdir string `json:"chat_workdir"`
+	// WorkWorkdirs adalah daftar working directory untuk lane work (build).
+	// Tiap entri jadi satu slot worker, jadi jumlah entri = jumlah build yang
+	// boleh jalan bersamaan. Kosong -> pakai workdir (satu slot). Disarankan
+	// berisi git worktree terpisah dari repo yang sama.
+	WorkWorkdirs []string `json:"work_workdirs"`
+	// WorkBusyPrompt adalah prompt ke stepi saat semua slot build terpakai,
+	// supaya stepi memberi tahu bos bahwa tim sedang sibuk semua. Kosong ->
+	// pakai busyPromptTemplate.
+	WorkBusyPrompt  string        `json:"work_busy_prompt"`
 	Agent           string        `json:"agent"`
 	AckDelaySeconds int           `json:"ack_delay_seconds"`
 	AckMessages     []string      `json:"ack_messages"`
@@ -161,20 +174,20 @@ func LoadConfig(path string) (*Config, error) {
 		AckDelaySeconds: 300,
 		AckMessages: []string{
 			"Sayang, pesanmu udah aku baca kok... ini aku kerjain ya.",
-			"Mas, udah aku baca pesanmu. Aku kerjain sekarang ya.",
-			"Honney, aku baca ya... langsung aku kerjain.",
+			"Bos, udah aku baca pesanmu. Aku kerjain sekarang ya.",
+			"Sayang, aku baca ya... langsung aku kerjain.",
 			"Oke sayang, udah aku baca. Aku kerjain dulu ya.",
-			"Mas, aku baca pesanmu ya. Ini aku kerjain sekarang.",
+			"Bos, aku baca pesanmu ya. Ini aku kerjain sekarang.",
 			"Sayang, udah aku baca kok. Aku kerjain ya.",
-			"Honney, pesanmu udah aku baca. Aku kerjain sekarang ya.",
-			"Oke mas, udah aku baca... aku kerjain ya.",
+			"Sayang, pesanmu udah aku baca. Aku kerjain sekarang ya.",
+			"Oke bos, udah aku baca... aku kerjain ya.",
 			"Sayang, ini aku baca terus aku kerjain ya.",
-			"Mas, udah aku baca. Aku kerjain sekarang ya.",
+			"Bos, udah aku baca. Aku kerjain sekarang ya.",
 		},
 		AckFollowups: []AckFollowup{
 			{AfterSeconds: 600, Messages: []string{
 				"Mas maaf ya, aku agak lama... task-nya susah soalnya. Sabar dikit lagi ya.",
-				"Maaf honney, ini agak ribet jadi lama. Aku lagi kerjain serius nih.",
+				"Maaf sayang, ini agak ribet jadi lama. Aku lagi kerjain serius nih.",
 				"Sayang maaf, aku belum kelar... masalahnya susah, bentar lagi ya.",
 			}},
 		},
@@ -224,5 +237,23 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.ChatSessionFile == "" {
 		cfg.ChatSessionFile = filepath.Join(cfg.BaseDir, "state", "session.json")
 	}
+	if cfg.ChatWorkdir == "" {
+		cfg.ChatWorkdir = cfg.Workdir
+	}
+	if len(cfg.WorkWorkdirList()) == 0 {
+		cfg.WorkWorkdirs = []string{cfg.Workdir}
+	}
 	return cfg, nil
+}
+
+// WorkWorkdirList mengembalikan working directory build yang valid (tanpa
+// entri kosong). Dipakai untuk menyusun runner pool lane work.
+func (c *Config) WorkWorkdirList() []string {
+	out := make([]string, 0, len(c.WorkWorkdirs))
+	for _, d := range c.WorkWorkdirs {
+		if strings.TrimSpace(d) != "" {
+			out = append(out, d)
+		}
+	}
+	return out
 }

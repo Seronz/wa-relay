@@ -49,6 +49,13 @@ func chunkText(text string, size int) []string {
 	return out
 }
 
+// isMissingSession melaporkan apakah kegagalan opencode disebabkan sesi yang
+// diminta sudah tidak ada lagi di DB (mis. sesi dihapus manual). opencode
+// menulis "Error: Session not found" ke stderr lalu keluar dengan status 1.
+func isMissingSession(stderr string) bool {
+	return strings.Contains(strings.ToLower(stderr), "session not found")
+}
+
 func errorNote(err error, stderr string) string {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "(error: timeout: agent terlalu lama)"
