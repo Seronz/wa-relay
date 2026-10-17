@@ -1,0 +1,119 @@
+package relay
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os/exec"
+	"strings"
+	"syscall"
+	"time"
+)
+
+type taskItem struct {
+	ID   string `json:"id"`
+	Text string `json:"text"`
+	// Chat adalah target mark-read untuk pesan ini, sudah dihitung handleHook
+	// lewat chatTarget (Chat -> SenderJID -> OwnerJID -> OwnerPhone).
+	Chat string `json:"chat"`
+	Lane Lane   `json:"lane"`
+}
+
+// TaskRunner runs the agent for a prompt and returns raw stdout/stderr.
+// sessionID, bila tidak kosong, melanjutkan sesi opencode yang sama.
+type TaskRunner interface {
+	Run(ctx context.Context, prompt, sessionID string) (stdout string, stderr string, err error)
+}
+
+type ExecRunner struct {
+	Bin     string
+	Workdir string
+	BaseDir string
+	Agent   string
+	Timeout time.Duration
+}
+
+// args builds the `opencode run` argument list. Exposed for testing.
+func (r *ExecRunner) args(prompt, sessionID string) []string {
+	args := []string{"run", "--dir", r.Workdir, "--format", "json", "--title", "wa-relay"}
+	if r.Agent != "" {
+		args = append(args, "--agent", r.Agent)
+	}
+	if sessionID != "" {
+		args = append(args, "--session", sessionID)
+	}
+	return append(args, prompt)
+}
+
+func (r *ExecRunner) Run(ctx context.Context, prompt, sessionID string) (string, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, r.Bin, r.args(prompt, sessionID)...)
+	cmd.Dir = r.BaseDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return stdout.String(), stderr.String(), context.DeadlineExceeded
+	}
+	return stdout.String(), stderr.String(), err
+}
+
+// Sender delivers a reply message to the owner.
+type Sender interface {
+	Send(text string) error
+}
+
+type WacliSender struct {
+	Bin   string
+	Phone string
+}
+
+func (s *WacliSender) Send(text string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+	defer cancel()
+	return runCommand(ctx, s.Bin, "send", "text", "--to", s.Phone, "--message", text)
+}
+
+// MarkReader menandai satu chat sebagai sudah dibaca (read receipt).
+type MarkReader interface {
+	MarkRead(chat string) error
+}
+
+type WacliMarkReader struct {
+	Bin string
+}
+
+// args builds the `wacli chats mark-read` argument list. Exposed for testing.
+// Flag --receipts yang mengirim read receipt diserahkan sepenuhnya ke wacli,
+// termasuk soal privasi read receipt milik user.
+func (m *WacliMarkReader) args(chat string) []string {
+	return []string{"chats", "mark-read", "--chat", chat, "--receipts"}
+}
+
+func (m *WacliMarkReader) MarkRead(chat string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), markReadTimeout)
+	defer cancel()
+	return runCommand(ctx, m.Bin, m.args(chat)...)
+}
+
+// runCommand menjalankan sebuah command dan, bila gagal, mengembalikan error
+// yang memuat potongan output untuk diagnosis.
+func runCommand(ctx context.Context, name string, args ...string) error {
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	if detail := truncateRunes(strings.TrimSpace(string(out)), stderrMaxRune); detail != "" {
+		return fmt.Errorf("%v: %s", err, detail)
+	}
+	return err
+}
