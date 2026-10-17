@@ -12,7 +12,7 @@ import (
 // delegationPromptTemplate diteruskan ke stepi (agent chat) saat ada tugas
 // berat: dia meringkas requirement dan meminta konfirmasi bos sebelum
 // delegasi ke tim teknis.
-const delegationPromptTemplate = "Pesan WhatsApp dari irza:\n---\n%s\n---\n" +
+const delegationPromptTemplate = "Pesan WhatsApp dari bos:\n---\n%s\n---\n" +
 	"Tugas ini terlihat teknis/berat. Kamu sebagai asisten eksekutif harus:" +
 	"\n1. Ringkaskan requirement-nya sebagai daftar angka (1, 2, 3, dst), bahasa Indonesia santai dan singkat." +
 	"\n2. Akhiri dengan konfirmasi ke bos bahwa tugas ini akan didelegasikan ke tim teknis, contoh: \"Aku delegasikan tugas ini ke tim teknis, bos setuju?\"" +
@@ -30,6 +30,17 @@ const summarizePromptTemplate = "Hasil pengerjaan tim teknis untuk tugas:\n---\n
 	"Rangkum hasilnya untuk bos lewat WhatsApp, bahasa Indonesia santai, singkat dan padat." +
 	" Sampaikan status selesai + poin penting saja. Jangan terlalu teknis kecuali dibutuhkan." +
 	" Langsung ke balasan, tanpa proses berpikir, tanpa judul markdown, tanpa tabel, tanpa fence kode."
+
+// busyPromptTemplate diteruskan ke stepi saat semua slot build terpakai, supaya
+// bos dikabari bahwa tim sedang sibuk semua (bukan dibiarkan menunggu diam).
+const busyPromptTemplate = "Semua slot tim teknis (build) sedang terpakai, jadi tugas berat ini belum bisa didelegasikan. " +
+	"Sampaikan ke bos dengan singkat dan natural (bahasa Indonesia santai/gaul) bahwa tim lagi sibuk semua " +
+	"dan tugasnya akan dikerjakan begitu ada yang kosong." +
+	" Langsung ke balasan, tanpa proses berpikir, tanpa judul markdown, tanpa tabel, tanpa fence kode."
+
+// busyFallback dipakai kalau stepi gagal menyusun pesan sibuk, supaya bos tetap
+// mendapat kabar.
+const busyFallback = "Tim lagi sibuk semua, nanti aku kabari ya."
 
 // confirmationRe cocok balasan singkat yang berarti "setuju" dari bos.
 var confirmationRe = regexp.MustCompile(`(?i)^\s*(ya|iya|setuju|oke|ok|gas|lanjut|proses|approve|yes|y)\b`)

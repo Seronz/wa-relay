@@ -29,8 +29,13 @@ Relay menyimpan `sessionID` opencode di `state/session.json`. Pesan pertama memb
 (`--title wa-relay`), lalu pesan-pesan berikutnya dijalankan dengan `opencode run --session <id>`
 sehingga agent **ingat percakapan sebelumnya** (tidak lagi lupa konteks antar pesan).
 
+- **Sesi sengaja di-reset tiap restart relay.** Saat start, id sesi lama dibuang (lihat catatan di
+  `cmd/wa-relay/main.go`), jadi tiap restart selalu mulai obrolan baru. Ini disengaja supaya relay
+  tidak nyangkut id sesi yang sudah dihapus dari opencode (`Session not found`).
 - Kirim `/reset` (persis, boleh ada spasi) di WhatsApp untuk menghapus sesi dan mulai dari nol.
-- Hapus manual: `rm state/session.json` lalu restart relay.
+- Sesi juga otomatis di-rollover kalau nganggur >24 jam, umur >7 hari, atau >20 pesan.
+- Kalau id sesi tersimpan ternyata sudah hilang, relay otomatis melepas pointer dan mulai sesi baru
+  (tidak macet permanen).
 - Catatan: sesi yang terus lanjut akan makin panjang (token makin besar) — pakai `/reset` sesekali.
 
 ## Spesifikasi payload & signature (wacli)

@@ -78,8 +78,8 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 	// baru. Sesi lama tidak dihapus dari DB, cuma dicatat di prev_id.
 	sessionID := r.beginSession(item.Lane, time.Now())
 	prompt := fmt.Sprintf(promptTemplate, strings.TrimSpace(item.Text))
-	stdout, stderr, err := r.run(taskCtx, item.Lane, sessionID, item.ID, prompt)
-	if sessionID == "" {
+	stdout, stderr, usedID, err := r.runRecovering(taskCtx, r.runnerFor(item.Lane), item.Lane, sessionID, item.ID, prompt)
+	if usedID == "" {
 		r.saveSessionFromOutput(item.Lane, stdout)
 	}
 	if err != nil {
@@ -97,11 +97,21 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 }
 
 // proposeDelegation mengarahkan stepi untuk meringkas requirement tugas berat
-// dan meminta konfirmasi bos sebelum delegasi ke tim teknis.
+// dan meminta konfirmasi bos sebelum delegasi ke tim teknis. Bila semua slot
+// build sedang terpakai, tugas tidak diusulkan: stepi langsung mengabari bos
+// bahwa tim sedang sibuk semua.
 func (r *Relay) proposeDelegation(ctx context.Context, item taskItem) {
+	if !r.workAvailable() {
+		r.sendBusy(ctx, item)
+		r.log.Info("delegation busy id=%s", item.ID)
+		return
+	}
 	sessionID := r.beginSession(LaneChat, time.Now())
 	prompt := fmt.Sprintf(delegationPromptTemplate, strings.TrimSpace(item.Text))
-	stdout, _, err := r.run(ctx, LaneChat, sessionID, item.ID, prompt)
+	stdout, _, usedID, err := r.runRecovering(ctx, r.runnerFor(LaneChat), LaneChat, sessionID, item.ID, prompt)
+	if usedID == "" {
+		r.saveSessionFromOutput(LaneChat, stdout)
+	}
 	if err != nil {
 		r.log.Error("delegation proposal failed: %v", err)
 		r.markRead(item.Chat)
@@ -122,10 +132,45 @@ func (r *Relay) proposeDelegation(ctx context.Context, item taskItem) {
 	r.log.Info("delegation proposed id=%s", item.ID)
 }
 
+// sendBusy meminta stepi mengabari bos bahwa semua slot build sedang terpakai.
+// Kalau stepi gagal, pesan cadangan tetap dikirim supaya bos tidak didiamkan.
+func (r *Relay) sendBusy(ctx context.Context, item taskItem) {
+	r.markRead(item.Chat)
+	prompt := strings.TrimSpace(r.cfg.WorkBusyPrompt)
+	if prompt == "" {
+		prompt = busyPromptTemplate
+	}
+	sessionID := r.beginSession(LaneChat, time.Now())
+	stdout, _, usedID, err := r.runRecovering(ctx, r.runnerFor(LaneChat), LaneChat, sessionID, item.ID, prompt)
+	if usedID == "" {
+		r.saveSessionFromOutput(LaneChat, stdout)
+	}
+	if err != nil {
+		r.log.Error("busy notice failed: %v", err)
+		r.sendChunked(busyFallback)
+		return
+	}
+	reply := extractReply(stdout)
+	if reply == "" {
+		reply = busyFallback
+	}
+	r.sendChunked(reply)
+}
+
 // runDelegation menjalankan pipeline delegasi di background: agent teknis
 // (build) mengerjakan tugas, lalu stepi merangkum hasilnya untuk bos. Jalankan
 // dalam goroutine sendiri agar chat tidak terblokir sambil build berjalan.
 func (r *Relay) runDelegation(ctx context.Context, item taskItem, d *Delegation) {
+	// Pesan satu slot build. Bila dua-duanya sudah terpakai, jangan antre diam:
+	// kabari bos lewat stepi bahwa tim lagi sibuk semua.
+	buildRunner, releaseBuild, ok := r.acquireWork()
+	if !ok {
+		r.sendBusy(ctx, taskItem{ID: item.ID, Chat: d.Chat})
+		r.log.Info("delegation busy at confirm id=%s delegate_id=%s", item.ID, d.ID)
+		return
+	}
+	defer releaseBuild()
+
 	schedCtx, stopSchedule := context.WithCancel(context.WithoutCancel(ctx))
 	scheduleDone := make(chan struct{})
 	go func() {
@@ -137,10 +182,10 @@ func (r *Relay) runDelegation(ctx context.Context, item taskItem, d *Delegation)
 		<-scheduleDone
 	}()
 
-	// 1. Agent teknis mengerjakan tugas (sesi work terpisah).
+	// 1. Agent teknis mengerjakan tugas (slot + sesi work terpisah).
 	buildID := r.beginSession(LaneWork, time.Now())
 	buildPrompt := fmt.Sprintf(buildPromptTemplate, d.Text)
-	stdout, stderr, err := r.run(ctx, LaneWork, buildID, d.ID, buildPrompt)
+	stdout, stderr, _, err := r.runRecovering(ctx, buildRunner, LaneWork, buildID, d.ID, buildPrompt)
 	if err != nil {
 		r.log.Error("delegation build failed: %v (stderr %dB)", err, len(stderr))
 		r.markRead(d.Chat)
@@ -153,7 +198,10 @@ func (r *Relay) runDelegation(ctx context.Context, item taskItem, d *Delegation)
 	// 2. Stepi merangkum hasil untuk bos (sesi chat).
 	sumID := r.beginSession(LaneChat, time.Now())
 	sumPrompt := fmt.Sprintf(summarizePromptTemplate, stdout)
-	sumStdout, _, err := r.run(ctx, LaneChat, sumID, d.ID, sumPrompt)
+	sumStdout, _, usedSumID, err := r.runRecovering(ctx, r.runnerFor(LaneChat), LaneChat, sumID, d.ID, sumPrompt)
+	if usedSumID == "" {
+		r.saveSessionFromOutput(LaneChat, sumStdout)
+	}
 	if err != nil {
 		r.log.Error("delegation summarize failed: %v", err)
 		r.markRead(d.Chat)
