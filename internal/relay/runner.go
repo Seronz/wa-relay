@@ -1,4 +1,4 @@
-package main
+package relay
 
 import (
 	"bytes"
@@ -18,12 +18,30 @@ import (
 )
 
 const (
-	maxSeen         = 500
-	defaultChunk    = 3000
-	sendTimeout     = 120 * time.Second
-	stderrMaxRune   = 400
-	seenFlushPeriod = 2 * time.Second
-	defaultWorkers  = 3
+	MaxSeen            = 500
+	queueBuffer        = 256
+	defaultChunk       = 3000
+	sendTimeout        = 120 * time.Second
+	markReadTimeout    = 30 * time.Second
+	stderrMaxRune      = 400
+	seenFlushPeriod    = 2 * time.Second
+	defaultWorkers     = 3
+	defaultChatWorkers = 1
+	defaultLightMaxLen = 400
+
+	// Default rollover sesi: 24 jam nganggur, umur maksimum 7 hari, atau 60
+	// pesan — mana yang lebih dulu kena. Lihat Config.SessionRollPolicy.
+	defaultSessionIdleSeconds   = 24 * 60 * 60
+	defaultSessionMaxAgeSeconds = 7 * 24 * 60 * 60
+	defaultSessionMaxTurns      = 60
+
+	// defaultWorkAgent adalah agent opencode untuk lane work (tugas teknis),
+	// supaya tidak memakai persona chat.
+	defaultWorkAgent = "build"
+
+	// defaultDelegationTTLSeconds adalah batas waktu menunggu konfirmasi bos
+	// sebelum delegasi kadaluarsa (default 30 menit).
+	defaultDelegationTTLSeconds = 1800
 )
 
 type SeenStore struct {
@@ -49,7 +67,7 @@ func LoadSeen(path string, max int) *SeenStore {
 		done:   make(chan struct{}),
 	}
 	if max <= 0 {
-		s.max = maxSeen
+		s.max = MaxSeen
 	}
 	data, err := os.ReadFile(path)
 	if err == nil {
@@ -149,6 +167,10 @@ func (s *SeenStore) persist() {
 type taskItem struct {
 	ID   string `json:"id"`
 	Text string `json:"text"`
+	// Chat adalah target mark-read untuk pesan ini, sudah dihitung handleHook
+	// lewat chatTarget (Chat -> SenderJID -> OwnerJID -> OwnerPhone).
+	Chat string `json:"chat"`
+	Lane Lane   `json:"lane"`
 }
 
 // TaskRunner runs the agent for a prompt and returns raw stdout/stderr.
@@ -224,48 +246,179 @@ func (s *WacliSender) Send(text string) error {
 	return nil
 }
 
-type Relay struct {
-	cfg     *Config
-	log     *Logger
-	seen    *SeenStore
-	session *SessionStore
-	queue   chan taskItem
-	runner  TaskRunner
-	sender  Sender
+// MarkReader menandai satu chat sebagai sudah dibaca (read receipt).
+type MarkReader interface {
+	MarkRead(chat string) error
 }
 
-func (r *Relay) worker(ctx context.Context) {
+type WacliMarkReader struct {
+	Bin string
+}
+
+// args builds the `wacli chats mark-read` argument list. Exposed for testing.
+// Flag --receipts yang mengirim read receipt diserahkan sepenuhnya ke wacli,
+// termasuk soal privasi read receipt milik user.
+func (m *WacliMarkReader) args(chat string) []string {
+	return []string{"chats", "mark-read", "--chat", chat, "--receipts"}
+}
+
+func (m *WacliMarkReader) MarkRead(chat string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), markReadTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, m.Bin, m.args(chat)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		detail := truncateRunes(strings.TrimSpace(string(out)), stderrMaxRune)
+		if detail != "" {
+			return fmt.Errorf("%v: %s", err, detail)
+		}
+		return err
+	}
+	return nil
+}
+
+type Relay struct {
+	cfg         *Config
+	log         *Logger
+	seen        *SeenStore
+	session     *SessionStore // sesi chat WhatsApp (dipertahankan ingatannya)
+	workSession *SessionStore // sesi tugas berat (opsional, terpisah dari chat)
+	queue       chan taskItem // antrean legacy (masih dipakai test)
+	chatQueue   chan taskItem
+	workQueue   chan taskItem
+	runner      TaskRunner
+	workRunner  TaskRunner       // runner khusus lane work; nil = pakai runner
+	delegations *DelegationStore // delegasi pending menunggu konfirmasi bos
+	sender      Sender
+	reader      MarkReader
+	gate        sessionGate
+}
+
+// NewRelay menyusun Relay lengkap dengan antrean dan dependensinya.
+func NewRelay(cfg *Config, log *Logger, seen *SeenStore, session *SessionStore, runner TaskRunner, sender Sender, reader MarkReader) *Relay {
+	return NewRelayWithWork(cfg, log, seen, session, nil, runner, sender, reader)
+}
+
+// NewRelayWithWork menyusun Relay dengan sesi kerja terpisah (opsional).
+func NewRelayWithWork(cfg *Config, log *Logger, seen *SeenStore, chatSession, workSession *SessionStore, runner TaskRunner, sender Sender, reader MarkReader) *Relay {
+	return &Relay{
+		cfg:         cfg,
+		log:         log,
+		seen:        seen,
+		session:     chatSession,
+		workSession: workSession,
+		chatQueue:   make(chan taskItem, queueBuffer),
+		workQueue:   make(chan taskItem, queueBuffer),
+		queue:       make(chan taskItem, queueBuffer), // legacy support for tests
+		runner:      runner,
+		sender:      sender,
+		reader:      reader,
+	}
+}
+
+// SetWorkRunner memasang runner khusus lane work (agent teknis). Bila tidak
+// dipanggil, lane work memakai runner chat (fallback).
+func (r *Relay) SetWorkRunner(runner TaskRunner) {
+	r.workRunner = runner
+}
+
+// SetDelegations memasang penyimpanan delegasi pending (konfirmasi bos).
+func (r *Relay) SetDelegations(store *DelegationStore) {
+	r.delegations = store
+}
+
+func (r *Relay) chatWorker(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case item, ok := <-r.queue:
+		case item, ok := <-r.chatQueue:
 			if !ok {
 				return
+			}
+			r.handleMessage(ctx, item)
+		case item, ok := <-r.queue:
+			if !ok {
+				continue
 			}
 			r.handleMessage(ctx, item)
 		}
 	}
 }
 
-// startWorkers menjalankan beberapa worker sekaligus (worker pool) supaya satu
-// task yang lambat tidak menahan task lain di antrean. Jumlahnya dari config
-// num_workers (default defaultWorkers).
-func (r *Relay) startWorkers(ctx context.Context) {
+func (r *Relay) workWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case item, ok := <-r.workQueue:
+			if !ok {
+				return
+			}
+			r.handleMessage(ctx, item)
+		case item, ok := <-r.queue:
+			if !ok {
+				continue
+			}
+			r.handleMessage(ctx, item)
+		}
+	}
+}
+
+// runnerFor memilih runner sesuai lane: lane work memakai runner terpisah
+// (agent teknis) supaya tugas berat tidak dikerjakan persona chat. Bila
+// workRunner nil, fallback ke runner biasa.
+func (r *Relay) runnerFor(lane Lane) TaskRunner {
+	if lane == LaneWork && r.workRunner != nil {
+		return r.workRunner
+	}
+	return r.runner
+}
+
+// StartWorkers menjalankan worker pool yang dipisah per lane, supaya balasan
+// chat tidak pernah antre di belakang tugas berat: chat_workers worker khusus
+// chatQueue, num_workers worker khusus workQueue. Keduanya juga membaca queue
+// legacy (masih dipakai oleh test).
+func (r *Relay) StartWorkers(ctx context.Context) {
 	n := r.cfg.NumWorkers
 	if n <= 0 {
 		n = defaultWorkers
 	}
-	for i := 0; i < n; i++ {
-		go r.worker(ctx)
+	chat := r.cfg.ChatWorkers
+	if chat <= 0 {
+		chat = defaultChatWorkers
 	}
-	r.log.Info("worker pool started count=%d", n)
+	for i := 0; i < chat; i++ {
+		go r.chatWorker(ctx)
+	}
+	for i := 0; i < n; i++ {
+		go r.workWorker(ctx)
+	}
+	r.log.Info("worker pool started chat=%d work=%d", chat, n)
+}
+
+// markRead menandai chat pesan owner sebagai sudah dibaca lewat wacli.
+// Dipanggil dari handleMessage tepat sebelum balasan final dikirim, supaya
+// pesan yang masuk masih centang dua abu-abu dan hanya berubah biru ketika
+// balasan sudah disiapkan (termasuk untuk fast-path ping/reset dan balasan
+// error). Privasi read receipt diserahkan ke wacli lewat flag --receipts
+// (mengikuti setting privasi user), tidak diatur di sini.
+func (r *Relay) markRead(chat string) {
+	if r.reader == nil || !r.cfg.MarkRead || chat == "" {
+		return
+	}
+	if err := r.reader.MarkRead(chat); err != nil {
+		r.log.Warn("mark-read failed chat=%s err=%v", chat, err)
+		return
+	}
+	r.log.Info("mark-read ok chat=%s", chat)
 }
 
 func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 	start := time.Now()
 	r.log.Info("task start id=%s text_len=%d", item.ID, len(item.Text))
 	if strings.EqualFold(strings.TrimSpace(item.Text), "ping") {
+		r.markRead(item.Chat)
 		r.sendChunked("pong")
 		r.log.Info("task done id=%s fast-path duration=%.1fs", item.ID, time.Since(start).Seconds())
 		return
@@ -277,8 +430,32 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 				r.log.Error("session reset failed: %v", err)
 			}
 		}
+		if r.delegations != nil {
+			r.delegations.Clear(item.Chat)
+		}
+		r.markRead(item.Chat)
 		r.sendChunked("oke, kita mulai dari awal ya 😊")
 		r.log.Info("task done id=%s reset duration=%.1fs", item.ID, time.Since(start).Seconds())
+		return
+	}
+
+	// Konfirmasi bos ("setuju", dst) ke delegasi pending: jalankan pipeline
+	// delegasi di background supaya chat tidak terblokir sambil build jalan.
+	if confirmationRe.MatchString(item.Text) {
+		if d, ok := r.delegations.Get(item.Chat); ok {
+			r.delegations.Clear(item.Chat)
+			go r.runDelegation(context.WithoutCancel(ctx), item, d)
+			r.markRead(item.Chat)
+			r.log.Info("delegation confirmed id=%s delegate_id=%s", item.ID, d.ID)
+			return
+		}
+		r.delegations.Clear(item.Chat)
+	}
+
+	// Tugas berat: stepi duluan meringkas requirement dan meminta konfirmasi
+	// bos. Tim teknis baru dikerjakan setelah bos balas konfirmasi.
+	if item.Lane == LaneWork {
+		r.proposeDelegation(ctx, item)
 		return
 	}
 	// Ack pertama & follow-up hanya dikirim kalau task masih jalan (lihat
@@ -303,35 +480,198 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 	}()
 
 	// Lanjutkan sesi opencode yang sama supaya agent ingat obrolan sebelumnya.
+	// Sesi yang sudah basi (nganggur kelamaan, umur kelamaan, atau kebanyakan
+	// pesan) di-rollover di sini: id-nya dilepas supaya pesan ini mulai sesi
+	// baru. Sesi lama tidak dihapus dari DB, cuma dicatat di prev_id.
 	sessionID := ""
-	if r.session != nil {
-		sessionID = r.session.ID()
+	rollPolicy := r.cfg.SessionRollPolicy()
+	if item.Lane == LaneWork {
+		if r.workSession != nil {
+			id, reason := r.workSession.Begin(time.Now(), rollPolicy)
+			sessionID = id
+			r.logRollover("work", reason)
+		}
+	} else {
+		if r.session != nil {
+			id, reason := r.session.Begin(time.Now(), rollPolicy)
+			sessionID = id
+			r.logRollover("chat", reason)
+		}
 	}
-
 	prompt := fmt.Sprintf(promptTemplate, strings.TrimSpace(item.Text))
-	stdout, stderr, err := r.runner.Run(taskCtx, prompt, sessionID)
-	if sessionID == "" && r.session != nil {
-		if id := parseSessionID(stdout); id != "" {
-			if serr := r.session.Set(id); serr != nil {
-				r.log.Error("session save failed: %v", serr)
-			} else {
-				r.log.Info("session saved id=%s", id)
+	lockKey := sessionID
+	if lockKey == "" {
+		if item.Lane == LaneWork {
+			lockKey = "work:" + r.workSessionPath() + ":" + item.ID
+		} else {
+			lockKey = "chat:" + r.chatSessionPath() + ":" + item.ID
+		}
+	}
+	unlock := r.gate.lock(lockKey)
+	stdout, stderr, err := r.runnerFor(item.Lane).Run(taskCtx, prompt, sessionID)
+	unlock()
+	if sessionID == "" {
+		if item.Lane == LaneWork {
+			if r.workSession != nil {
+				if id := parseSessionID(stdout); id != "" {
+					if serr := r.workSession.Set(id); serr != nil {
+						r.log.Error("session save failed: %v", serr)
+					} else {
+						r.log.Info("session saved id=%s", id)
+					}
+				}
+			}
+		} else {
+			if r.session != nil {
+				if id := parseSessionID(stdout); id != "" {
+					if serr := r.session.Set(id); serr != nil {
+						r.log.Error("session save failed: %v", serr)
+					} else {
+						r.log.Info("session saved id=%s", id)
+					}
+				}
 			}
 		}
 	}
 	if err != nil {
 		r.log.Error("opencode failed: %v (stderr %dB)", err, len(stderr))
+		r.markRead(item.Chat)
 		r.sendChunked(errorNote(err, stderr))
 		r.log.Info("task failed id=%s duration=%.1fs", item.ID, time.Since(start).Seconds())
 		return
 	}
 	r.log.Info("opencode done duration=%.1fs stdout=%dB stderr=%dB", time.Since(start).Seconds(), len(stdout), len(stderr))
 	reply := extractReply(stdout)
+	r.markRead(item.Chat)
 	r.sendChunked(reply)
 	r.log.Info("task done id=%s reply_len=%d duration=%.1fs", item.ID, len(reply), time.Since(start).Seconds())
 }
 
-// pickRandom mengembalikan satu pesan acak dari pool (kosong jika pool kosong).
+// proposeDelegation mengarahkan stepi untuk meringkas requirement tugas berat
+// dan meminta konfirmasi bos sebelum delegasi ke tim teknis.
+func (r *Relay) proposeDelegation(ctx context.Context, item taskItem) {
+	sessionID := ""
+	if r.session != nil {
+		id, reason := r.session.Begin(time.Now(), r.cfg.SessionRollPolicy())
+		sessionID = id
+		r.logRollover("chat", reason)
+	}
+	prompt := fmt.Sprintf(delegationPromptTemplate, strings.TrimSpace(item.Text))
+	lockKey := sessionID
+	if lockKey == "" {
+		lockKey = "chat:" + r.chatSessionPath() + ":" + item.ID
+	}
+	unlock := r.gate.lock(lockKey)
+	stdout, _, err := r.runnerFor(LaneChat).Run(ctx, prompt, sessionID)
+	unlock()
+	if err != nil {
+		r.log.Error("delegation proposal failed: %v", err)
+		r.markRead(item.Chat)
+		r.sendChunked(errorNote(err, ""))
+		return
+	}
+	reply := extractReply(stdout)
+	r.markRead(item.Chat)
+	r.sendChunked(reply)
+	if r.delegations != nil {
+		r.delegations.Set(&Delegation{
+			ID:        item.ID,
+			Text:      item.Text,
+			Chat:      item.Chat,
+			CreatedAt: time.Now(),
+		})
+	}
+	r.log.Info("delegation proposed id=%s", item.ID)
+}
+
+// runDelegation menjalankan pipeline delegasi di background: agent teknis
+// (build) mengerjakan tugas, lalu stepi merangkum hasilnya untuk bos. Jalankan
+// dalam goroutine sendiri agar chat tidak terblokir sambil build berjalan.
+func (r *Relay) runDelegation(ctx context.Context, item taskItem, d *Delegation) {
+	schedCtx, stopSchedule := context.WithCancel(context.WithoutCancel(ctx))
+	scheduleDone := make(chan struct{})
+	go func() {
+		defer close(scheduleDone)
+		r.sendScheduled(schedCtx, item)
+	}()
+	defer func() {
+		stopSchedule()
+		<-scheduleDone
+	}()
+
+	// 1. Agent teknis mengerjakan tugas (sesi work terpisah).
+	sessionID := ""
+	if r.workSession != nil {
+		id, reason := r.workSession.Begin(time.Now(), r.cfg.SessionRollPolicy())
+		sessionID = id
+		r.logRollover("work", reason)
+	}
+	buildPrompt := fmt.Sprintf(buildPromptTemplate, d.Text)
+	lockKey := sessionID
+	if lockKey == "" {
+		lockKey = "work:" + r.workSessionPath() + ":" + d.ID
+	}
+	unlock := r.gate.lock(lockKey)
+	stdout, stderr, err := r.runnerFor(LaneWork).Run(ctx, buildPrompt, sessionID)
+	unlock()
+	if err != nil {
+		r.log.Error("delegation build failed: %v (stderr %dB)", err, len(stderr))
+		r.markRead(d.Chat)
+		r.sendChunked(errorNote(err, stderr))
+		r.log.Info("delegation failed id=%s delegate_id=%s duration=%.1fs", item.ID, d.ID, time.Since(d.CreatedAt).Seconds())
+		return
+	}
+	r.log.Info("delegation build done delegate_id=%s stdout=%dB", d.ID, len(stdout))
+
+	// 2. Stepi merangkum hasil untuk bos (sesi chat).
+	sumSessionID := ""
+	if r.session != nil {
+		id, reason := r.session.Begin(time.Now(), r.cfg.SessionRollPolicy())
+		sumSessionID = id
+		r.logRollover("chat", reason)
+	}
+	sumPrompt := fmt.Sprintf(summarizePromptTemplate, stdout)
+	lockKey = sumSessionID
+	if lockKey == "" {
+		lockKey = "chat:" + r.chatSessionPath() + ":" + d.ID
+	}
+	unlock = r.gate.lock(lockKey)
+	sumStdout, _, err := r.runnerFor(LaneChat).Run(ctx, sumPrompt, sumSessionID)
+	unlock()
+	if err != nil {
+		r.log.Error("delegation summarize failed: %v", err)
+		r.markRead(d.Chat)
+		r.sendChunked(errorNote(err, ""))
+		return
+	}
+	reply := extractReply(sumStdout)
+	r.markRead(d.Chat)
+	r.sendChunked(reply)
+	r.log.Info("delegation done delegate_id=%s reply_len=%d duration=%.1fs", d.ID, len(reply), time.Since(d.CreatedAt).Seconds())
+}
+
+// logRollover mencatat alasan sesi di-rollover supaya kelihatan di relay.log.
+func (r *Relay) logRollover(lane, reason string) {
+	if reason == "" {
+		return
+	}
+	r.log.Info("session rollover lane=%s reason=%s -> mulai sesi baru", lane, reason)
+}
+
+func (r *Relay) chatSessionPath() string {
+	if r != nil && r.session != nil {
+		return r.session.Path()
+	}
+	return ""
+}
+
+func (r *Relay) workSessionPath() string {
+	if r != nil && r.workSession != nil {
+		return r.workSession.Path()
+	}
+	return r.cfg.WorkSessionFile
+}
+
 func pickRandom(messages []string) string {
 	pool := make([]string, 0, len(messages))
 	for _, m := range messages {

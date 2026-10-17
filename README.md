@@ -61,6 +61,7 @@ sehingga agent **ingat percakapan sebelumnya** (tidak lagi lupa konteks antar pe
 | `opencode_bin` / `wacli_bin` | Path binary |
 | `num_workers` | Jumlah worker paralel yang menguras antrean (default 3) |
 | `timeout_seconds` | Timeout `opencode run` (default 900) |
+| `mark_read` | Tandai pesan owner sebagai sudah dibaca / kirim read receipt lewat `wacli chats mark-read --receipts` (default `true`); dikirim tepat sebelum balasan final, bukan saat pesan masuk |
 | `log_file` | Log file relay |
 
 `opencode.json` berisi permission untuk agent yang di-spawn relay: allow read/edit/glob/grep/list, `external_directory` allow-all, bash allow-all tapi **last-match-wins deny** untuk `rm -rf *`, `sudo *`, `git push *`. Longgarkan/ketatkan sesuai kebutuhan.
@@ -68,7 +69,7 @@ sehingga agent **ingat percakapan sebelumnya** (tidak lagi lupa konteks antar pe
 ## Build & pemakaian
 
 ```bash
-go build -o wa-relay .   # atau langsung ./start.sh (auto-build kalau binary belum ada)
+go build -o wa-relay ./cmd/wa-relay   # atau langsung ./start.sh (auto-build kalau binary belum ada)
 ./start.sh               # restart relay + sync (delegasi ke systemd jika terpasang)
 ./stop.sh                # stop keduanya
 go test ./...            # jalankan test

@@ -1,4 +1,4 @@
-package main
+package relay
 
 import (
 	"crypto/hmac"
@@ -79,7 +79,8 @@ func respond(w http.ResponseWriter, code int, payload map[string]any) {
 	w.Write(body)
 }
 
-func (r *Relay) routes() http.Handler {
+// Routes mengembalikan handler HTTP untuk endpoint relay.
+func (r *Relay) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		respond(w, http.StatusOK, map[string]any{"ok": true})
@@ -115,12 +116,41 @@ func (r *Relay) handleHook(w http.ResponseWriter, req *http.Request) {
 		respond(w, http.StatusOK, map[string]any{"ok": true, "ignored": "duplicate"})
 		return
 	}
-	item := taskItem{ID: msg.ID, Text: strings.TrimSpace(msg.Text)}
+	item := taskItem{ID: msg.ID, Text: strings.TrimSpace(msg.Text), Chat: chatTarget(r.cfg, &msg), Lane: Classify(r.cfg, msg.Text)}
+	// Target antrean menurut lane, supaya tugas berat tidak pernah macet di
+	// antrean chat dan sebaliknya. `queue` (legacy) tetap jadi fallback.
+	var target chan taskItem
+	switch item.Lane {
+	case LaneWork:
+		target = r.workQueue
+	default:
+		target = r.chatQueue
+	}
 	select {
+	case target <- item:
+		r.log.Info("queued id=%s len=%d lane=%s", item.ID, len(item.Text), item.Lane)
+		respond(w, http.StatusOK, map[string]any{"ok": true, "queued": true})
 	case r.queue <- item:
-		r.log.Info("queued id=%s len=%d", item.ID, len(item.Text))
+		r.log.Info("queued id=%s len=%d lane=unified", item.ID, len(item.Text))
 		respond(w, http.StatusOK, map[string]any{"ok": true, "queued": true})
 	default:
 		respond(w, http.StatusOK, map[string]any{"ok": true, "ignored": "queue-full"})
+	}
+}
+
+// chatTarget memilih identifier chat untuk mark-read: chat asli pesan bila
+// ada, lalu sender, lalu fallback ke identitas owner dari config. Hasilnya
+// dibawa lewat taskItem.Chat dan dipakai handleMessage tepat sebelum balasan
+// final dikirim.
+func chatTarget(cfg *Config, msg *hookPayload) string {
+	switch {
+	case msg.Chat != "":
+		return msg.Chat
+	case msg.SenderJID != "":
+		return msg.SenderJID
+	case cfg.OwnerJID != "":
+		return cfg.OwnerJID
+	default:
+		return cfg.OwnerPhone
 	}
 }

@@ -1,4 +1,4 @@
-package main
+package relay
 
 import (
 	"bytes"
@@ -46,16 +46,20 @@ func newTestRelay(t *testing.T, cfg *Config, runner TaskRunner, sender Sender) *
 		t.Fatal(err)
 	}
 	t.Cleanup(log.Close)
-	seen := LoadSeen(filepath.Join(t.TempDir(), "seen.json"), maxSeen)
+	seen := LoadSeen(filepath.Join(t.TempDir(), "seen.json"), MaxSeen)
 	t.Cleanup(seen.Close)
 	return &Relay{
-		cfg:     cfg,
-		log:     log,
-		seen:    seen,
-		session: LoadSession(filepath.Join(t.TempDir(), "session.json")),
-		queue:   make(chan taskItem, 16),
-		runner:  runner,
-		sender:  sender,
+		cfg:         cfg,
+		log:         log,
+		seen:        seen,
+		session:     LoadSession(filepath.Join(t.TempDir(), "session.json")),
+		workSession: LoadSession(filepath.Join(t.TempDir(), "work-session.json")),
+		chatQueue:   make(chan taskItem, 16),
+		workQueue:   make(chan taskItem, 16),
+		queue:       make(chan taskItem, 16),
+		runner:      runner,
+		delegations: LoadDelegationStore(filepath.Join(t.TempDir(), "delegations.json"), time.Minute),
+		sender:      sender,
 	}
 }
 
@@ -63,12 +67,16 @@ type stubSender struct {
 	mu   sync.Mutex
 	sent []string
 	fail bool
+	rec  func(event string)
 }
 
 func (s *stubSender) Send(text string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sent = append(s.sent, text)
+	if s.rec != nil {
+		s.rec("send:" + text)
+	}
 	if s.fail {
 		return errors.New("send failed")
 	}
@@ -81,6 +89,78 @@ func (s *stubSender) messages() []string {
 	return append([]string(nil), s.sent...)
 }
 
+type stubMarkReader struct {
+	mu    sync.Mutex
+	chats []string
+	err   error
+	rec   func(event string)
+}
+
+func (s *stubMarkReader) MarkRead(chat string) error {
+	s.mu.Lock()
+	s.chats = append(s.chats, chat)
+	err := s.err
+	rec := s.rec
+	s.mu.Unlock()
+	if rec != nil {
+		rec("mark-read:" + chat)
+	}
+	return err
+}
+
+func (s *stubMarkReader) calls() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.chats...)
+}
+
+// eventLog mencatat urutan peristiwa lintas stub (runner, mark-read, sender)
+// supaya urutan mark-read vs balasan final bisa diverifikasi deterministik.
+type eventLog struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (e *eventLog) add(ev string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.events = append(e.events, ev)
+}
+
+func (e *eventLog) list() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.events...)
+}
+
+func assertEvents(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("events = %v, want %v", got, want)
+		}
+	}
+}
+
+// waitEvent menunggu satu peristiwa terekam di log (untuk sinkronisasi
+// dengan goroutine handleMessage yang berjalan paralel dengan test).
+func waitEvent(t *testing.T, e *eventLog, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, ev := range e.list() {
+			if ev == want {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("event %q tidak tercatat: %v", want, e.list())
+}
+
 type stubRunner struct {
 	mu       sync.Mutex
 	stdout   string
@@ -90,6 +170,7 @@ type stubRunner struct {
 	prompt   string
 	delay    time.Duration
 	sessions []string
+	rec      func(event string)
 }
 
 func (s *stubRunner) Run(_ context.Context, prompt, sessionID string) (string, string, error) {
@@ -97,10 +178,16 @@ func (s *stubRunner) Run(_ context.Context, prompt, sessionID string) (string, s
 	s.calls++
 	s.prompt = prompt
 	s.sessions = append(s.sessions, sessionID)
-	stdout, stderr, err, delay := s.stdout, s.stderr, s.err, s.delay
+	stdout, stderr, err, delay, rec := s.stdout, s.stderr, s.err, s.delay, s.rec
 	s.mu.Unlock()
+	if rec != nil {
+		rec("runner-start")
+	}
 	if delay > 0 {
 		time.Sleep(delay)
+	}
+	if rec != nil {
+		rec("runner-done")
 	}
 	return stdout, stderr, err
 }
@@ -146,7 +233,7 @@ func postHook(t *testing.T, r *Relay, body []byte, sig string) *httptest.Respons
 		req.Header.Set("X-Wacli-Signature", sig)
 	}
 	rec := httptest.NewRecorder()
-	r.routes().ServeHTTP(rec, req)
+	r.Routes().ServeHTTP(rec, req)
 	return rec
 }
 
@@ -157,6 +244,34 @@ func decodeBody(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 		t.Fatalf("invalid json response %q: %v", rec.Body.String(), err)
 	}
 	return out
+}
+
+// hookItem mem-post payload ke /hook dan mengembalikan item yang masuk
+// antrean (atau gagal bila tidak ada).
+func hookItem(t *testing.T, r *Relay, cfg *Config, payload map[string]any) taskItem {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := postHook(t, r, body, signBody(cfg.WebhookSecret, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	if got := decodeBody(t, rec)["queued"]; got != true {
+		t.Fatalf("queued = %v, want true", got)
+	}
+	select {
+	case item := <-r.queue:
+		return item
+	case item := <-r.chatQueue:
+		return item
+	case item := <-r.workQueue:
+		return item
+	default:
+		t.Fatal("expected an item in queue")
+		return taskItem{}
+	}
 }
 
 func TestVerifySignature(t *testing.T) {
@@ -262,7 +377,7 @@ func TestHookIgnoreFilters(t *testing.T) {
 			if got := decodeBody(t, rec)["ignored"]; got != tc.want {
 				t.Fatalf("ignored = %v, want %v", got, tc.want)
 			}
-			if len(r.queue) != 0 {
+			if len(r.queue) != 0 || len(r.chatQueue) != 0 || len(r.workQueue) != 0 {
 				t.Fatal("nothing should be queued")
 			}
 		})
@@ -285,13 +400,16 @@ func TestHookQueuesValidMessageAndDedupes(t *testing.T) {
 	if got["queued"] != true || got["ok"] != true {
 		t.Fatalf("response = %v, want queued true", got)
 	}
+	var item taskItem
 	select {
-	case item := <-r.queue:
-		if item.ID != "MSG1" || item.Text != "halo dunia" {
-			t.Fatalf("queued item = %+v", item)
-		}
+	case item = <-r.queue:
+	case item = <-r.chatQueue:
+	case item = <-r.workQueue:
 	default:
 		t.Fatal("expected an item in queue")
+	}
+	if item.ID != "MSG1" || item.Text != "halo dunia" {
+		t.Fatalf("queued item = %+v", item)
 	}
 
 	rec = postHook(t, r, body, signBody(cfg.WebhookSecret, body))
@@ -303,7 +421,7 @@ func TestHookQueuesValidMessageAndDedupes(t *testing.T) {
 func TestHealthEndpoint(t *testing.T) {
 	r := newTestRelay(t, testConfig(t), &stubRunner{}, &stubSender{})
 	rec := httptest.NewRecorder()
-	r.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	r.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code = %d, want 200", rec.Code)
 	}
@@ -312,7 +430,7 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	r.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
+	r.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("not found code = %d, want 404", rec.Code)
 	}
@@ -320,7 +438,7 @@ func TestHealthEndpoint(t *testing.T) {
 
 func TestSeenStorePersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "seen.json")
-	s := LoadSeen(path, maxSeen)
+	s := LoadSeen(path, MaxSeen)
 	defer s.Close()
 	if s.Seen("m1") {
 		t.Fatal("m1 should be new")
@@ -351,7 +469,7 @@ func TestSeenStorePersistence(t *testing.T) {
 		t.Fatalf("ids = %v, want [m1 m2]", ids)
 	}
 
-	reloaded := LoadSeen(path, maxSeen)
+	reloaded := LoadSeen(path, MaxSeen)
 	defer reloaded.Close()
 	if !reloaded.Seen("m1") {
 		t.Fatal("m1 should still be duplicate after reload")
@@ -363,7 +481,7 @@ func TestSeenStorePersistence(t *testing.T) {
 
 func TestSeenStoreKeepsLast500(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "seen.json")
-	s := LoadSeen(path, maxSeen)
+	s := LoadSeen(path, MaxSeen)
 	defer s.Close()
 	for i := 0; i < 600; i++ {
 		s.Seen(fmt.Sprintf("x%d", i))
@@ -377,14 +495,14 @@ func TestSeenStoreKeepsLast500(t *testing.T) {
 	if err := json.Unmarshal(data, &ids); err != nil {
 		t.Fatal(err)
 	}
-	if len(ids) != maxSeen {
-		t.Fatalf("persisted len = %d, want %d", len(ids), maxSeen)
+	if len(ids) != MaxSeen {
+		t.Fatalf("persisted len = %d, want %d", len(ids), MaxSeen)
 	}
 	if ids[0] != "x100" || ids[len(ids)-1] != "x599" {
 		t.Fatalf("window = [%s..%s], want [x100..x599]", ids[0], ids[len(ids)-1])
 	}
-	if len(s.ids) != maxSeen {
-		t.Fatalf("memory len = %d, want %d", len(s.ids), maxSeen)
+	if len(s.ids) != MaxSeen {
+		t.Fatalf("memory len = %d, want %d", len(s.ids), MaxSeen)
 	}
 	if !s.Seen("x599") || s.Seen("x600") {
 		t.Fatal("dedupe window incorrect after eviction")
@@ -490,7 +608,7 @@ func TestWorkerPoolRunsInParallel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r.startWorkers(ctx)
+	r.StartWorkers(ctx)
 
 	for i := 0; i < cfg.NumWorkers; i++ {
 		r.queue <- taskItem{ID: fmt.Sprintf("p%d", i), Text: "halo"}
@@ -524,6 +642,227 @@ func TestWorkerFastTaskSendsNoAck(t *testing.T) {
 	got := sender.messages()
 	if len(got) != 1 || got[0] != "jawaban" {
 		t.Fatalf("sent = %v, want [jawaban] (task cepat tidak boleh kirim ack)", got)
+	}
+}
+
+type recordingRunner struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (r *recordingRunner) Run(context.Context, string, string) (string, string, error) {
+	r.mu.Lock()
+	r.n++
+	r.mu.Unlock()
+	return `{"type":"text","part":{"text":"ok"}}`, "", nil
+}
+
+func (r *recordingRunner) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.n
+}
+
+func TestWorkLaneUsesWorkRunner(t *testing.T) {
+	cfg := testConfig(t)
+	chatRunner := &recordingRunner{}
+	workRunner := &recordingRunner{}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, chatRunner, sender)
+	r.SetWorkRunner(workRunner)
+	chat := "6281234567890@s.whatsapp.net"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Proposal pakai chat runner (stepi), bukan work runner.
+	r.handleMessage(ctx, taskItem{ID: "w1", Text: "coding", Lane: LaneWork, Chat: chat})
+	deadline := time.After(time.Second)
+	for chatRunner.count()+workRunner.count() < 1 {
+		select {
+		case <-deadline:
+			t.Fatalf("runner tidak dipanggil chat=%d work=%d", chatRunner.count(), workRunner.count())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if chatRunner.count() != 1 || workRunner.count() != 0 {
+		t.Fatalf("chat=%d work=%d, mau chat=1 work=0 (proposal lewat stepi)", chatRunner.count(), workRunner.count())
+	}
+
+	// Konfirmasi bos -> work runner dipakai (build + rangkuman lewat stepi).
+	sender.sent = nil
+	r.handleMessage(ctx, taskItem{ID: "c1", Text: "setuju", Lane: LaneChat, Chat: chat})
+	deadline = time.After(time.Second)
+	for chatRunner.count()+workRunner.count() < 3 {
+		select {
+		case <-deadline:
+			t.Fatalf("delegasi tidak dieksekusi chat=%d work=%d", chatRunner.count(), workRunner.count())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if chatRunner.count() != 2 || workRunner.count() != 1 {
+		t.Fatalf("chat=%d work=%d, mau chat=2 work=1", chatRunner.count(), workRunner.count())
+	}
+}
+
+func TestWorkHeavyTaskDoesNotBlockChat(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.NumWorkers = 1
+	cfg.ChatWorkers = 1
+	chatRunner := &stubRunner{stdout: `{"type":"text","part":{"text":"pong"}}`}
+	workRunner := &poolRunner{release: make(chan struct{})}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, chatRunner, sender)
+	r.SetWorkRunner(workRunner)
+	chat := "6281234567890@s.whatsapp.net"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.StartWorkers(ctx)
+
+	// Tugas berat: proposal cepat (chat runner), tidak nunggu build.
+	r.workQueue <- taskItem{ID: "w1", Text: "buat kode", Lane: LaneWork, Chat: chat}
+	deadline := time.After(2 * time.Second)
+	for len(sender.messages()) < 1 {
+		select {
+		case <-deadline:
+			t.Fatal("proposal lambat")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if len(sender.messages()) != 1 || sender.messages()[0] != "pong" {
+		t.Fatalf("sent = %v, want [pong]", sender.messages())
+	}
+
+	// Konfirmasi -> build diblokir (poolRunner), tapi chat masih balas cepat.
+	// Sambil build diblokir belum boleh ada balasan baru.
+	sender.sent = nil
+	r.handleMessage(ctx, taskItem{ID: "c2", Text: "setuju", Lane: LaneChat, Chat: chat})
+	if len(sender.messages()) != 0 {
+		t.Fatalf("build masih diblokir tapi sudah ada balasan: %v", sender.messages())
+	}
+	r.chatQueue <- taskItem{ID: "c3", Text: "halo", Lane: LaneChat, Chat: chat}
+	deadline = time.After(2 * time.Second)
+	for len(sender.messages()) < 1 {
+		select {
+		case <-deadline:
+			t.Fatal("chat diblokir sambil build jalan")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	got := sender.messages()
+	if len(got) != 1 || got[0] != "pong" {
+		t.Fatalf("sent = %v, want [pong]", got)
+	}
+	close(workRunner.release)
+}
+
+type echoRunner struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (e *echoRunner) Run(_ context.Context, prompt string, _ string) (string, string, error) {
+	e.mu.Lock()
+	e.calls = append(e.calls, prompt)
+	n := len(e.calls)
+	e.mu.Unlock()
+	switch n {
+	case 1:
+		return `{"type":"text","part":{"text":"noted bos, aku rangkumin requirement: 1, 2, dst. Aku delegasikan tugas ini ke tim teknis, bos setuju?"}}`, "", nil
+	case 2:
+		return `{"type":"text","part":{"text":"kode sudah selesai dikerjakan tim teknis"}}`, "", nil
+	case 3:
+		return `{"type":"text","part":{"text":"siap bos, fitur X sudah selesai dan siap dipakai"}}`, "", nil
+	}
+	return `{"type":"text","part":{"text":"ok"}}`, "", nil
+}
+
+func (e *echoRunner) nth(i int) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if i < 0 || i >= len(e.calls) {
+		return ""
+	}
+	return e.calls[i]
+}
+
+func TestDelegationDikonfirmasiBos(t *testing.T) {
+	cfg := testConfig(t)
+	runner := &echoRunner{}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, runner, sender)
+	r.SetWorkRunner(runner)
+	chat := "6281234567890@s.whatsapp.net"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 1. Tugas berat: stepi usulkan delegasi + minta konfirmasi.
+	r.handleMessage(ctx, taskItem{ID: "w1", Text: "buat fitur X", Lane: LaneWork, Chat: chat})
+	if got := sender.messages(); len(got) != 1 || !strings.Contains(got[0], "bos setuju") {
+		t.Fatalf("proposal = %v, ingin ada konfirmasi ke bos", got)
+	}
+
+	// 2. Bos setuju: build + rangkuman di latar belakang.
+	sender.sent = nil
+	r.handleMessage(ctx, taskItem{ID: "c1", Text: "setuju", Lane: LaneChat, Chat: chat})
+
+	deadline := time.After(2 * time.Second)
+	for len(sender.messages()) < 1 {
+		select {
+		case <-deadline:
+			t.Fatal("delegasi tidak dieksekusi setelah konfirmasi")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	final := sender.messages()
+	if len(final) != 1 || !strings.Contains(final[0], "selesai") {
+		t.Fatalf("final = %v, ingin rangkuman selesai", final)
+	}
+	if got := runner.nth(0); !strings.Contains(got, "Ringkaskan requirement") {
+		t.Fatalf("panggilan ke-1 bukan proposal: %q", got)
+	}
+	if got := runner.nth(1); !strings.Contains(got, "Selesaikan sebaik-baiknya") {
+		t.Fatalf("panggilan ke-2 bukan build: %q", got)
+	}
+	if got := runner.nth(2); !strings.Contains(got, "Rangkum hasilnya") {
+		t.Fatalf("panggilan ke-3 bukan rangkuman: %q", got)
+	}
+}
+
+func TestDelegationBukanKonfirmasiDibatalkan(t *testing.T) {
+	cfg := testConfig(t)
+	runner := &echoRunner{}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, runner, sender)
+	r.SetWorkRunner(runner)
+	chat := "6281234567890@s.whatsapp.net"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r.handleMessage(ctx, taskItem{ID: "w1", Text: "buat fitur X", Lane: LaneWork, Chat: chat})
+
+	// Balasan non-konfirmasi sambil pending: batalin delegasi, obrolan biasa.
+	r.handleMessage(ctx, taskItem{ID: "c2", Text: "halo apa kabar", Lane: LaneChat, Chat: chat})
+
+	// Tugas berat baru: usul lagi, jangan langsung build.
+	r.handleMessage(ctx, taskItem{ID: "w3", Text: "buat fitur Y", Lane: LaneWork, Chat: chat})
+
+	if got := runner.nth(0); !strings.Contains(got, "Ringkaskan requirement") {
+		t.Fatalf("panggilan ke-1 bukan proposal: %q", got)
+	}
+	if got := runner.nth(1); !strings.Contains(got, "Balas sebagai dirimu sendiri") {
+		t.Fatalf("panggilan ke-2 bukan chat biasa: %q", got)
+	}
+	if got := runner.nth(2); !strings.Contains(got, "Ringkaskan requirement") {
+		t.Fatalf("panggilan ke-3 bukan proposal: %q", got)
+	}
+	for i := 0; i < len(runner.calls); i++ {
+		if strings.Contains(runner.calls[i], "Selesaikan sebaik-baiknya") {
+			t.Fatalf("build seharusnya belum dijalankan: panggilan %d = %q", i+1, runner.calls[i])
+		}
 	}
 }
 
@@ -765,7 +1104,7 @@ func TestRelayPersistsAndReusesSession(t *testing.T) {
 	if got := r.session.ID(); got != "ses_test" {
 		t.Fatalf("session id = %q, want ses_test", got)
 	}
-	if got := LoadSession(r.session.path).ID(); got != "ses_test" {
+	if got := LoadSession(r.session.Path()).ID(); got != "ses_test" {
 		t.Fatalf("persisted session = %q, want ses_test", got)
 	}
 
@@ -869,5 +1208,333 @@ func TestLoggerWritesToBothWhenDifferentTargets(t *testing.T) {
 		if !strings.Contains(string(data), "ke-dua") {
 			t.Fatalf("%s tidak berisi log: %q", p, string(data))
 		}
+	}
+}
+
+func TestWacliMarkReaderArgs(t *testing.T) {
+	got := strings.Join((&WacliMarkReader{Bin: "wacli"}).args("6281234567890@s.whatsapp.net"), " ")
+	want := "chats mark-read --chat 6281234567890@s.whatsapp.net --receipts"
+	if got != want {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestLoadConfigMarkReadDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"owner_jid":"6281234567890@s.whatsapp.net"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.MarkRead {
+		t.Fatal("mark_read harus default true bila tidak diset")
+	}
+
+	if err := os.WriteFile(path, []byte(`{"mark_read":false}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MarkRead {
+		t.Fatal("mark_read:false di config harus dihormati")
+	}
+}
+
+func TestExampleConfigEnablesMarkRead(t *testing.T) {
+	cfg, err := LoadConfig(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatalf("config.example.json tidak bisa dibaca: %v", err)
+	}
+	if !cfg.MarkRead {
+		t.Fatal("config.example.json harus memuat mark_read true")
+	}
+}
+
+func TestHookDoesNotMarkReadOnQueue(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MarkRead = true
+	r := newTestRelay(t, cfg, &stubRunner{}, &stubSender{})
+	reader := &stubMarkReader{}
+	r.reader = reader
+
+	item := hookItem(t, r, cfg, validPayload())
+	if item.ID != "MSG1" || item.Chat != cfg.OwnerJID {
+		t.Fatalf("item = %+v, want id=MSG1 chat=%s", item, cfg.OwnerJID)
+	}
+	// Pesan yang baru masuk antrean harus tetap centang dua abu-abu;
+	// mark-read hanya boleh terjadi saat balasan disiapkan di handleMessage.
+	time.Sleep(30 * time.Millisecond)
+	if got := reader.calls(); len(got) != 0 {
+		t.Fatalf("mark-read dipanggil saat pesan masuk antrean: %v", got)
+	}
+}
+
+func TestMarkReadAfterRunnerDoneBeforeReply(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MarkRead = true
+	elog := &eventLog{}
+	runner := &stubRunner{stdout: `{"type":"text","part":{"text":"halo dari agent"}}`, rec: elog.add}
+	sender := &stubSender{rec: elog.add}
+	r := newTestRelay(t, cfg, runner, sender)
+	reader := &stubMarkReader{rec: elog.add}
+	r.reader = reader
+
+	item := hookItem(t, r, cfg, validPayload())
+	r.handleMessage(context.Background(), item)
+
+	if got := reader.calls(); len(got) != 1 || got[0] != cfg.OwnerJID {
+		t.Fatalf("mark-read = %v, want [%s]", got, cfg.OwnerJID)
+	}
+	assertEvents(t, elog.list(), []string{
+		"runner-start",
+		"runner-done",
+		"mark-read:" + cfg.OwnerJID,
+		"send:halo dari agent",
+	})
+}
+
+func TestMarkReadNotCalledBeforeRunnerDone(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MarkRead = true
+	elog := &eventLog{}
+	runner := &stubRunner{
+		stdout: `{"type":"text","part":{"text":"jawaban"}}`,
+		delay:  300 * time.Millisecond,
+		rec:    elog.add,
+	}
+	r := newTestRelay(t, cfg, runner, &stubSender{})
+	reader := &stubMarkReader{}
+	r.reader = reader
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.handleMessage(context.Background(), taskItem{ID: "slow", Text: "halo", Chat: cfg.OwnerJID})
+	}()
+
+	waitEvent(t, elog, "runner-start")
+	if got := reader.calls(); len(got) != 0 {
+		t.Fatalf("mark-read terjadi sebelum runner.Run selesai: %v", got)
+	}
+	waitEvent(t, elog, "runner-done")
+	<-done
+	if got := reader.calls(); len(got) != 1 || got[0] != cfg.OwnerJID {
+		t.Fatalf("mark-read = %v, want [%s]", got, cfg.OwnerJID)
+	}
+}
+
+func TestMarkReadOnErrorBeforeErrorNote(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MarkRead = true
+	elog := &eventLog{}
+	runner := &stubRunner{err: errors.New("boom"), stderr: "agent gagal", rec: elog.add}
+	sender := &stubSender{rec: elog.add}
+	r := newTestRelay(t, cfg, runner, sender)
+	reader := &stubMarkReader{rec: elog.add}
+	r.reader = reader
+
+	item := hookItem(t, r, cfg, validPayload())
+	r.handleMessage(context.Background(), item)
+
+	if got := reader.calls(); len(got) != 1 || got[0] != cfg.OwnerJID {
+		t.Fatalf("mark-read = %v, want [%s]", got, cfg.OwnerJID)
+	}
+	events := elog.list()
+	prefix := []string{"runner-start", "runner-done", "mark-read:" + cfg.OwnerJID}
+	if len(events) != len(prefix)+1 {
+		t.Fatalf("events = %v, want %v + send error", events, prefix)
+	}
+	for i, ev := range prefix {
+		if events[i] != ev {
+			t.Fatalf("events = %v, want %v + send error", events, prefix)
+		}
+	}
+	if !strings.HasPrefix(events[3], "send:(error:") {
+		t.Fatalf("event terakhir = %q, want send:(error: ...)", events[3])
+	}
+}
+
+func TestMarkReadOnFastPath(t *testing.T) {
+	t.Run("ping", func(t *testing.T) {
+		cfg := testConfig(t)
+		cfg.MarkRead = true
+		elog := &eventLog{}
+		runner := &stubRunner{rec: elog.add}
+		sender := &stubSender{rec: elog.add}
+		r := newTestRelay(t, cfg, runner, sender)
+		reader := &stubMarkReader{rec: elog.add}
+		r.reader = reader
+
+		r.handleMessage(context.Background(), taskItem{ID: "p", Text: " PiNg ", Chat: cfg.OwnerJID})
+		if runner.calls != 0 {
+			t.Fatalf("runner calls = %d, want 0", runner.calls)
+		}
+		assertEvents(t, elog.list(), []string{"mark-read:" + cfg.OwnerJID, "send:pong"})
+	})
+
+	t.Run("reset", func(t *testing.T) {
+		cfg := testConfig(t)
+		cfg.MarkRead = true
+		elog := &eventLog{}
+		runner := &stubRunner{rec: elog.add}
+		sender := &stubSender{rec: elog.add}
+		r := newTestRelay(t, cfg, runner, sender)
+		reader := &stubMarkReader{rec: elog.add}
+		r.reader = reader
+
+		r.handleMessage(context.Background(), taskItem{ID: "r", Text: "/reset", Chat: cfg.OwnerJID})
+		if runner.calls != 0 {
+			t.Fatalf("runner calls = %d, want 0", runner.calls)
+		}
+		assertEvents(t, elog.list(), []string{
+			"mark-read:" + cfg.OwnerJID,
+			"send:oke, kita mulai dari awal ya 😊",
+		})
+	})
+}
+
+func TestMarkReadUsesFallbackTarget(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MarkRead = true
+	r := newTestRelay(t, cfg, &stubRunner{}, &stubSender{})
+	reader := &stubMarkReader{}
+	r.reader = reader
+
+	payload := validPayload()
+	payload["Chat"] = ""
+	item := hookItem(t, r, cfg, payload)
+	if item.Chat != payload["SenderJID"] {
+		t.Fatalf("item.Chat = %v, want %v", item.Chat, payload["SenderJID"])
+	}
+	r.handleMessage(context.Background(), item)
+
+	got := reader.calls()
+	if len(got) != 1 || got[0] != payload["SenderJID"] {
+		t.Fatalf("mark-read = %v, want [%v]", got, payload["SenderJID"])
+	}
+}
+
+func TestChatTargetPriority(t *testing.T) {
+	owner := &Config{OwnerJID: "628111@s.whatsapp.net", OwnerPhone: "628111"}
+	phoneOnly := &Config{OwnerPhone: "628222"}
+	cases := []struct {
+		name string
+		cfg  *Config
+		msg  *hookPayload
+		want string
+	}{
+		{"chat diprioritaskan", owner, &hookPayload{Chat: "chat@s.whatsapp.net", SenderJID: "sender@s.whatsapp.net"}, "chat@s.whatsapp.net"},
+		{"lalu sender", owner, &hookPayload{SenderJID: "sender@s.whatsapp.net"}, "sender@s.whatsapp.net"},
+		{"lalu owner jid", owner, &hookPayload{}, "628111@s.whatsapp.net"},
+		{"terakhir owner phone", phoneOnly, &hookPayload{}, "628222"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := chatTarget(tc.cfg, tc.msg); got != tc.want {
+				t.Fatalf("chatTarget() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHookDoesNotMarkReadIgnored(t *testing.T) {
+	cases := []struct {
+		name       string
+		mutate     func(map[string]any)
+		clearOwner bool
+		want       string
+	}{
+		{"event", func(m map[string]any) { m["EventType"] = "receipt" }, false, "event"},
+		{"from me", func(m map[string]any) { m["FromMe"] = true }, false, "fromme"},
+		{"not owner", func(m map[string]any) { m["SenderJID"] = "6289999999999@s.whatsapp.net" }, false, "not-owner"},
+		{"group chat", func(m map[string]any) { m["Chat"] = "1234-5678@g.us"; m["SenderJID"] = "1234-5678@g.us" }, true, "group/status"},
+		{"empty text", func(m map[string]any) { m["Text"] = "" }, false, "empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			cfg.MarkRead = true
+			if tc.clearOwner {
+				cfg.OwnerJID = ""
+			}
+			r := newTestRelay(t, cfg, &stubRunner{}, &stubSender{})
+			reader := &stubMarkReader{}
+			r.reader = reader
+
+			payload := validPayload()
+			tc.mutate(payload)
+			body, _ := json.Marshal(payload)
+			rec := postHook(t, r, body, signBody(cfg.WebhookSecret, body))
+			if got := decodeBody(t, rec)["ignored"]; got != tc.want {
+				t.Fatalf("ignored = %v, want %v", got, tc.want)
+			}
+			time.Sleep(30 * time.Millisecond)
+			if got := reader.calls(); len(got) != 0 {
+				t.Fatalf("mark-read dipanggil untuk pesan ignored: %v", got)
+			}
+		})
+	}
+}
+
+func TestDuplicateMessageDoesNotMarkReadAgain(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MarkRead = true
+	r := newTestRelay(t, cfg, &stubRunner{stdout: `{"type":"text","part":{"text":"jawaban"}}`}, &stubSender{})
+	reader := &stubMarkReader{}
+	r.reader = reader
+
+	item := hookItem(t, r, cfg, validPayload())
+	r.handleMessage(context.Background(), item)
+	if got := reader.calls(); len(got) != 1 {
+		t.Fatalf("mark-read = %v, want 1 panggilan", got)
+	}
+
+	body, _ := json.Marshal(validPayload())
+	rec := postHook(t, r, body, signBody(cfg.WebhookSecret, body))
+	if got := decodeBody(t, rec)["ignored"]; got != "duplicate" {
+		t.Fatalf("ignored = %v, want duplicate", got)
+	}
+	if len(r.queue) != 0 || len(r.chatQueue) != 0 || len(r.workQueue) != 0 {
+		t.Fatal("duplikat tidak boleh masuk antrean")
+	}
+	if got := reader.calls(); len(got) != 1 {
+		t.Fatalf("mark-read untuk duplikat = %v, want cuma 1", got)
+	}
+}
+
+func TestMarkReadDisabledByConfig(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MarkRead = false
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, &stubRunner{stdout: `{"type":"text","part":{"text":"jawaban"}}`}, sender)
+	reader := &stubMarkReader{}
+	r.reader = reader
+
+	item := hookItem(t, r, cfg, validPayload())
+	r.handleMessage(context.Background(), item)
+
+	if got := reader.calls(); len(got) != 0 {
+		t.Fatalf("mark-read jalan padahal config off: %v", got)
+	}
+	if got := sender.messages(); len(got) != 1 || got[0] != "jawaban" {
+		t.Fatalf("sent = %v, want [jawaban]", got)
+	}
+}
+
+func TestMarkReadNilReaderIsSafe(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MarkRead = true
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, &stubRunner{stdout: `{"type":"text","part":{"text":"jawaban"}}`}, sender)
+
+	item := hookItem(t, r, cfg, validPayload())
+	r.handleMessage(context.Background(), item)
+
+	if got := sender.messages(); len(got) != 1 || got[0] != "jawaban" {
+		t.Fatalf("sent = %v, want [jawaban]", got)
 	}
 }

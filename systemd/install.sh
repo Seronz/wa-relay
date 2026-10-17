@@ -17,7 +17,7 @@ for unit in wa-relay.service wa-relay-sync.service; do
 done
 
 chmod +x "$REPO/run-sync.sh" 2>/dev/null || true
-[ -x "$REPO/wa-relay" ] || (cd "$REPO" && go build -o wa-relay .)
+[ -x "$REPO/wa-relay" ] || (cd "$REPO" && go build -o wa-relay ./cmd/wa-relay)
 
 systemctl --user daemon-reload
 systemctl --user enable --now wa-relay.service wa-relay-sync.service
