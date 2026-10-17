@@ -109,9 +109,5 @@ func (s *DelegationStore) persist() {
 	}
 	dir := filepath.Dir(s.path)
 	_ = os.MkdirAll(dir, 0o700)
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, s.path)
+	_ = writeFileAtomic(s.path, b, 0o600)
 }

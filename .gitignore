@@ -4,3 +4,4 @@ state/
 relay.log
 sync.log
 *.pid
+.aider*
