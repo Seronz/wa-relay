@@ -11,10 +11,6 @@ import (
 	"time"
 )
 
-const promptTemplate = "Pesan WhatsApp dari bos:\n---\n%s\n---\n" +
-	"Balas sebagai dirimu sendiri, singkat dan natural (bahasa Indonesia santai/gaul). " +
-	"Langsung ke balasan, tanpa proses berpikir, tanpa judul markdown, tanpa tabel, tanpa fence kode."
-
 // AckFollowup mengirim pesan penyemangat setelah task berjalan sekian detik.
 type AckFollowup struct {
 	AfterSeconds int      `json:"after_seconds"`
@@ -54,6 +50,16 @@ type Config struct {
 	// diterima. Default true; set false untuk mematikannya.
 	MarkRead bool `json:"mark_read"`
 
+	// SendFileEnabled mengizinkan relay mengirim file/foto ke WA ketika agent
+	// menyelipkan directive lampiran di balasannya. Default true.
+	SendFileEnabled bool `json:"send_file_enabled"`
+	// IncomingMediaEnabled mengunduh lampiran (foto/file) dari boss supaya
+	// agent bisa membacanya. Default true.
+	IncomingMediaEnabled bool `json:"incoming_media_enabled"`
+	// MediaDir adalah direktori penyimpanan lampiran masuk.
+	// Default <base>/state/media.
+	MediaDir string `json:"media_dir"`
+
 	// ChatWorkers adalah jumlah worker lane chat (pesan ringan). Default 1,
 	// supaya sesi chat hanya dipakai satu `opencode run` pada satu waktu
 	// (serialisasi per sesi) dan balasan ringan tidak pernah berebut sesi.
@@ -64,6 +70,17 @@ type Config struct {
 	// HeavyKeywords menambah kata kunci routing ke lane work selain
 	// defaultHeavyKeywords (cocok kata per kata, tanpa memperhatikan huruf besar/kecil).
 	HeavyKeywords []string `json:"heavy_keywords"`
+	// AutoWorkRouting mengaktifkan routing otomatis pesan ke lane work
+	// berdasarkan panjang/kata kunci teknis (perilaku lama). Default false:
+	// stepi murni resepsionis, tugas hanya diserahkan ke tim teknis saat bos
+	// memerintah eksplisit (lihat HandoverKeywords).
+	AutoWorkRouting bool `json:"auto_work_routing"`
+	// HandoverKeywords adalah frasa pemicu serah terima tugas ke tim teknis
+	// (mis. "serahin ke pak budi"). Ditambahkan ke defaultHandoverKeywords.
+	HandoverKeywords []string `json:"handover_keywords"`
+	// HandoverAck adalah pesan singkat stepi begitu tugas diserahkan ke tim
+	// teknis. Kosong -> defaultHandoverAck.
+	HandoverAck string `json:"handover_ack"`
 	// ChatSessionFile adalah file penyimpanan sesi chat WhatsApp.
 	// Default <base>/state/session.json (memori percakapan chat dipertahankan).
 	ChatSessionFile string `json:"chat_session_file"`
@@ -94,6 +111,9 @@ type Config struct {
 
 	heavyOnce sync.Once
 	heavyRe   *regexp.Regexp
+
+	handoverOnce sync.Once
+	handoverRe   *regexp.Regexp
 
 	BaseDir string `json:"-"`
 }
@@ -162,6 +182,42 @@ func (c *Config) HeavyPattern() *regexp.Regexp {
 	return c.heavyRe
 }
 
+// HandoverPattern mengompilasi regex pemicu serah terima tugas ke tim teknis
+// (default + config) secara lazy dan cache. Cocok frasa dengan word boundary.
+func (c *Config) HandoverPattern() *regexp.Regexp {
+	c.handoverOnce.Do(func() {
+		patterns := make([]string, 0, len(defaultHandoverKeywords)+len(c.HandoverKeywords))
+		for _, k := range append(append([]string{}, defaultHandoverKeywords...), c.HandoverKeywords...) {
+			k = strings.ToLower(strings.TrimSpace(k))
+			if k == "" {
+				continue
+			}
+			patterns = append(patterns, regexp.QuoteMeta(k))
+		}
+		if len(patterns) == 0 {
+			return
+		}
+		c.handoverRe = regexp.MustCompile(`(?i)\b(?:` + strings.Join(patterns, "|") + `)\b`)
+	})
+	return c.handoverRe
+}
+
+// IsHandover melaporkan apakah teks berisi perintah serah terima tugas ke tim
+// teknis (mis. "serahin aja ke Pak Budi").
+func (c *Config) IsHandover(text string) bool {
+	re := c.HandoverPattern()
+	return re != nil && re.MatchString(text)
+}
+
+// HandoverAckMessage mengembalikan pesan ack serah terima: config bila diisi,
+// selainnya defaultHandoverAck.
+func (c *Config) HandoverAckMessage() string {
+	if strings.TrimSpace(c.HandoverAck) != "" {
+		return c.HandoverAck
+	}
+	return defaultHandoverAck
+}
+
 func LoadConfig(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -198,6 +254,9 @@ func LoadConfig(path string) (*Config, error) {
 		LightMaxLen:    defaultLightMaxLen,
 		TimeoutSeconds: 900,
 		MarkRead:       true,
+
+		SendFileEnabled:      true,
+		IncomingMediaEnabled: true,
 
 		SessionIdleSeconds:   defaultSessionIdleSeconds,
 		SessionMaxAgeSeconds: defaultSessionMaxAgeSeconds,
@@ -236,6 +295,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.ChatSessionFile == "" {
 		cfg.ChatSessionFile = filepath.Join(cfg.BaseDir, "state", "session.json")
+	}
+	if cfg.MediaDir == "" {
+		cfg.MediaDir = filepath.Join(cfg.BaseDir, "state", "media")
 	}
 	if cfg.ChatWorkdir == "" {
 		cfg.ChatWorkdir = cfg.Workdir

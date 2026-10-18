@@ -86,6 +86,9 @@ func main() {
 	)
 	r.SetWorkPool(workRunners)
 	r.SetDelegations(delegations)
+	if cfg.IncomingMediaEnabled {
+		r.SetMediaDownloader(&relay.WacliMediaDownloader{Bin: cfg.WacliBin, Dir: cfg.MediaDir})
+	}
 	log.Info("workdirs chat=%s work=%v (slot build=%d)", cfg.ChatWorkdir, workDirs, len(workDirs))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -34,10 +34,20 @@
       ]
     }
   ],
+  "work_agent": "build",
+  "auto_work_routing": false,
+  "handover_keywords": [
+    "serahin ke pak budi",
+    "serahkan ke tim teknis"
+  ],
+  "handover_ack": "Oke Pak, tugasnya aku serahin ke Pak Budi ya.",
   "opencode_bin": "opencode",
   "wacli_bin": "wacli",
   "num_workers": 3,
   "timeout_seconds": 900,
   "mark_read": true,
+  "send_file_enabled": true,
+  "incoming_media_enabled": true,
+  "media_dir": "/home/zakaria/projects/wa-relay/state/media",
   "log_file": "/home/zakaria/projects/wa-relay/relay.log"
 }

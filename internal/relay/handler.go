@@ -16,8 +16,9 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 		r.log.Info("task done id=%s fast-path duration=%.1fs", item.ID, time.Since(start).Seconds())
 		return
 	}
-	// "/reset" menghapus sesi, jadi pesan berikutnya mulai obrolan baru.
-	if strings.TrimSpace(item.Text) == "/reset" {
+	// "/reset" (alias "!restart") menghapus sesi, jadi pesan berikutnya mulai
+	// obrolan baru.
+	if isResetCommand(item.Text) {
 		if r.session != nil {
 			if err := r.session.Set(""); err != nil {
 				r.log.Error("session reset failed: %v", err)
@@ -29,6 +30,15 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 		r.markRead(item.Chat)
 		r.sendChunked("oke, kita mulai dari awal ya 😊")
 		r.log.Info("task done id=%s reset duration=%.1fs", item.ID, time.Since(start).Seconds())
+		return
+	}
+
+	// Serah terima eksplisit ke tim teknis ("serahin aja ke Pak Budi") menang
+	// atas lane apa pun: stepi bertindak sebagai resepsionis dan meneruskan
+	// tugas, bukan mengeksekusi sendiri.
+	if r.cfg.IsHandover(item.Text) {
+		r.handleHandover(ctx, item)
+		r.log.Info("task done id=%s handover duration=%.1fs", item.ID, time.Since(start).Seconds())
 		return
 	}
 
@@ -72,12 +82,30 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 		<-scheduleDone
 	}()
 
+	// Lampiran (foto/file) dari bos diunduh dulu supaya agent bisa membacanya.
+	promptText := strings.TrimSpace(item.Text)
+	if item.Media != nil && r.cfg.IncomingMediaEnabled {
+		enriched, err := r.prepareMedia(item)
+		if err != nil {
+			r.log.Error("media download failed id=%s: %v", item.ID, err)
+			if promptText == "" {
+				r.markRead(item.Chat)
+				r.sendChunked("(error: lampiran tidak bisa diunduh)")
+				r.log.Info("task failed id=%s duration=%.1fs", item.ID, time.Since(start).Seconds())
+				return
+			}
+			promptText += "\n\n(lampiran yang dikirim tidak bisa diunduh)"
+		} else {
+			promptText = enriched
+		}
+	}
+
 	// Lanjutkan sesi opencode yang sama supaya agent ingat obrolan sebelumnya.
 	// Sesi yang sudah basi (nganggur kelamaan, umur kelamaan, atau kebanyakan
 	// pesan) di-rollover di sini: id-nya dilepas supaya pesan ini mulai sesi
 	// baru. Sesi lama tidak dihapus dari DB, cuma dicatat di prev_id.
 	sessionID := r.beginSession(item.Lane, time.Now())
-	prompt := fmt.Sprintf(promptTemplate, strings.TrimSpace(item.Text))
+	prompt := fmt.Sprintf(promptTemplate, promptText)
 	stdout, stderr, usedID, err := r.runRecovering(taskCtx, r.runnerFor(item.Lane), item.Lane, sessionID, item.ID, prompt)
 	if usedID == "" {
 		r.saveSessionFromOutput(item.Lane, stdout)
@@ -130,6 +158,43 @@ func (r *Relay) proposeDelegation(ctx context.Context, item taskItem) {
 		})
 	}
 	r.log.Info("delegation proposed id=%s", item.ID)
+}
+
+// handleHandover menangani perintah eksplisit bos untuk menyerahkan tugas ke
+// tim teknis ("serahin aja ke Pak Budi"): kabari bos bahwa tugas diserahkan,
+// lalu susun spesifikasi + jalankan build di latar belakang supaya worker chat
+// tidak terblokir. Bila semua slot build terpakai, minta stepi mengabari bos.
+func (r *Relay) handleHandover(ctx context.Context, item taskItem) {
+	if !r.workAvailable() {
+		r.sendBusy(ctx, item)
+		r.log.Info("handover busy id=%s", item.ID)
+		return
+	}
+	r.markRead(item.Chat)
+	r.sendChunked(r.cfg.HandoverAckMessage())
+	r.log.Info("handover accepted id=%s", item.ID)
+	go r.runHandover(context.WithoutCancel(ctx), item)
+}
+
+// runHandover menyusun spesifikasi tugas dari konteks obrolan (stepi), lalu
+// menyerahkannya ke pipeline delegasi (build + rangkuman). Fallback ke teks
+// perintah bos bila stepi gagal merumuskan.
+func (r *Relay) runHandover(ctx context.Context, item taskItem) {
+	sessionID := r.beginSession(LaneChat, time.Now())
+	prompt := fmt.Sprintf(handoverPromptTemplate, strings.TrimSpace(item.Text))
+	stdout, _, usedID, err := r.runRecovering(ctx, r.runnerFor(LaneChat), LaneChat, sessionID, item.ID, prompt)
+	if usedID == "" {
+		r.saveSessionFromOutput(LaneChat, stdout)
+	}
+	if err != nil {
+		r.log.Error("handover spec failed: %v", err)
+	}
+	spec := strings.TrimSpace(extractReply(stdout))
+	if spec == "" {
+		spec = strings.TrimSpace(item.Text)
+	}
+	d := &Delegation{ID: item.ID, Text: spec, Chat: item.Chat, CreatedAt: time.Now()}
+	r.runDelegation(ctx, item, d)
 }
 
 // sendBusy meminta stepi mengabari bos bahwa semua slot build sedang terpakai.
@@ -195,13 +260,12 @@ func (r *Relay) runDelegation(ctx context.Context, item taskItem, d *Delegation)
 	}
 	r.log.Info("delegation build done delegate_id=%s stdout=%dB", d.ID, len(stdout))
 
-	// 2. Stepi merangkum hasil untuk bos (sesi chat).
-	sumID := r.beginSession(LaneChat, time.Now())
-	sumPrompt := fmt.Sprintf(summarizePromptTemplate, stdout)
-	sumStdout, _, usedSumID, err := r.runRecovering(ctx, r.runnerFor(LaneChat), LaneChat, sumID, d.ID, sumPrompt)
-	if usedSumID == "" {
-		r.saveSessionFromOutput(LaneChat, sumStdout)
-	}
+	// 2. Stepi merangkum hasil untuk bos. Pakai sesi sekali pakai (bukan sesi
+	// chat): rangkuman tidak mengotori memori obrolan dan tidak memegang gate
+	// sesi chat, jadi balasan chat tidak ikut menunggu rangkuman. Output build
+	// dipotong sebagai jaring pengaman ukuran prompt.
+	sumPrompt := fmt.Sprintf(summarizePromptTemplate, truncateBytes(stdout, summarizeMaxBytes))
+	sumStdout, _, _, err := r.runRecovering(ctx, r.runnerFor(LaneChat), LaneChat, "", "summary-"+d.ID, sumPrompt)
 	if err != nil {
 		r.log.Error("delegation summarize failed: %v", err)
 		r.markRead(d.Chat)

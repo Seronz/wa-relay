@@ -20,6 +20,7 @@ type Relay struct {
 	delegations *DelegationStore // delegasi pending menunggu konfirmasi bos
 	sender      Sender
 	reader      MarkReader
+	media       MediaDownloader // pengunduh lampiran masuk (opsional)
 	gate        sessionGate
 }
 
@@ -83,6 +84,13 @@ func (r *Relay) workAvailable() bool {
 // SetDelegations memasang penyimpanan delegasi pending (konfirmasi bos).
 func (r *Relay) SetDelegations(store *DelegationStore) {
 	r.delegations = store
+}
+
+// SetMediaDownloader memasang pengunduh lampiran masuk. Bila tidak dipasang,
+// pesan berlampiran tetap diproses tapi tanpa file lokal (agent tidak bisa
+// membacanya).
+func (r *Relay) SetMediaDownloader(d MediaDownloader) {
+	r.media = d
 }
 
 func (r *Relay) chatWorker(ctx context.Context) {

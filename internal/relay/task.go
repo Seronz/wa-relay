@@ -17,6 +17,9 @@ type taskItem struct {
 	// lewat chatTarget (Chat -> SenderJID -> OwnerJID -> OwnerPhone).
 	Chat string `json:"chat"`
 	Lane Lane   `json:"lane"`
+	// Media berisi metadata lampiran (foto/file) yang dikirim bos, atau nil
+	// bila pesan murni teks. Lampirannya diunduh saat task dijalankan.
+	Media *MediaInfo `json:"media,omitempty"`
 }
 
 // TaskRunner runs the agent for a prompt and returns raw stdout/stderr.
@@ -33,8 +36,12 @@ type ExecRunner struct {
 	Timeout time.Duration
 }
 
-// args builds the `opencode run` argument list. Exposed for testing.
-func (r *ExecRunner) args(prompt, sessionID string) []string {
+// args builds the `opencode run` argument list. Prompt TIDAK ikut di sini:
+// prompt dikirim lewat stdin oleh Run supaya prompt raksasa (mis. rangkuman
+// hasil build ratusan KB) tidak kena batas panjang satu argumen OS
+// (MAX_ARG_STRLEN ~128KB) yang bikin fork/exec gagal dengan
+// "argument list too long". Exposed for testing.
+func (r *ExecRunner) args(sessionID string) []string {
 	args := []string{"run", "--dir", r.Workdir, "--format", "json", "--title", "wa-relay"}
 	if r.Agent != "" {
 		args = append(args, "--agent", r.Agent)
@@ -42,14 +49,17 @@ func (r *ExecRunner) args(prompt, sessionID string) []string {
 	if sessionID != "" {
 		args = append(args, "--session", sessionID)
 	}
-	return append(args, prompt)
+	return args
 }
 
 func (r *ExecRunner) Run(ctx context.Context, prompt, sessionID string) (string, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, r.Bin, r.args(prompt, sessionID)...)
+	cmd := exec.CommandContext(ctx, r.Bin, r.args(sessionID)...)
 	cmd.Dir = r.BaseDir
+	// Prompt lewat stdin: `opencode run` membaca pesan dari stdin bila tidak ada
+	// positional message, jadi prompt besar tidak dibatasi argumen OS.
+	cmd.Stdin = strings.NewReader(prompt)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
@@ -70,6 +80,9 @@ func (r *ExecRunner) Run(ctx context.Context, prompt, sessionID string) (string,
 // Sender delivers a reply message to the owner.
 type Sender interface {
 	Send(text string) error
+	// SendFile mengirim sebuah file/foto sebagai lampiran WhatsApp. caption
+	// boleh kosong.
+	SendFile(path, caption string) error
 }
 
 type WacliSender struct {
@@ -81,6 +94,16 @@ func (s *WacliSender) Send(text string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
 	return runCommand(ctx, s.Bin, "send", "text", "--to", s.Phone, "--message", text)
+}
+
+func (s *WacliSender) SendFile(path, caption string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), sendFileTimeout)
+	defer cancel()
+	args := []string{"send", "file", "--to", s.Phone, "--file", path}
+	if strings.TrimSpace(caption) != "" {
+		args = append(args, "--caption", caption)
+	}
+	return runCommand(ctx, s.Bin, args...)
 }
 
 // MarkReader menandai satu chat sebagai sudah dibaca (read receipt).

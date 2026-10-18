@@ -42,14 +42,26 @@ var defaultHeavyKeywords = []string{
 	"readme", "dokumentasi", "issue", "relay", "webhook",
 }
 
-// Classify menentukan lane sebuah pesan: ping//reset selalu chat; pesan yang
-// melebihi light_max_len atau mengandung kata kunci berat (lihat
-// defaultHeavyKeywords + config heavy_keywords) -> work; sisanya chat.
-// Klasifikasi dilakukan saat pesan masuk (hook) supaya pesan ringan langsung
-// masuk antrean chat sendiri dan tidak antre di belakang tugas berat.
+// defaultHandoverKeywords adalah frasa pemicu serah terima tugas ke tim teknis.
+// Dipakai saat bos memerintah stepi secara eksplisit (stepi sebagai
+// resepsionis), mis. "serahin aja tugasnya ke Pak Budi". Perilaku ini terpisah
+// dari routing otomatis (AutoWorkRouting).
+var defaultHandoverKeywords = []string{
+	"serahin", "serahkan", "serahin aja", "serah aja", "limpahkan", "limpahin",
+	"delegasikan", "delegasiin", "pak budi", "pakbudi", "tim teknis", "tim build",
+}
+
+// Classify menentukan lane sebuah pesan. Secara default semuanya masuk lane
+// chat (stepi resepsionis): tugas berat hanya diserahkan ke lane work saat bos
+// memerintah eksplisit lewat frasa serah terima (lihat Config.IsHandover).
+// Routing otomatis berdasarkan panjang/kata kunci (defaultHeavyKeywords +
+// config heavy_keywords) hanya aktif bila cfg.AutoWorkRouting diset true.
 func Classify(cfg *Config, text string) Lane {
 	t := strings.TrimSpace(text)
 	if t == "" || isFastCommand(t) {
+		return LaneChat
+	}
+	if cfg == nil || !cfg.AutoWorkRouting {
 		return LaneChat
 	}
 	maxLen := cfg.LightMaxLen
@@ -65,10 +77,18 @@ func Classify(cfg *Config, text string) Lane {
 	return LaneChat
 }
 
+// isResetCommand melaporkan apakah teks adalah perintah untuk mereset sesi
+// obrolan. "/reset" adalah bentuk lama; "!restart" alias yang sama. Keduanya
+// case-insensitive dan boleh diapit spasi.
+func isResetCommand(t string) bool {
+	s := strings.TrimSpace(t)
+	return strings.EqualFold(s, "/reset") || strings.EqualFold(s, "!restart")
+}
+
 // isFastCommand melaporkan apakah teks adalah perintah fast-path (tanpa
 // pemanggilan agent) yang ditangani langsung oleh handleMessage.
 func isFastCommand(t string) bool {
-	return strings.EqualFold(t, "ping") || t == "/reset"
+	return strings.EqualFold(t, "ping") || isResetCommand(t)
 }
 
 // sessionGate mengunci sesi berdasarkan kunci (id sesi, atau path store saat
