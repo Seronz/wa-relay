@@ -771,13 +771,20 @@ func TestClassifyRoutingToggle(t *testing.T) {
 
 func TestIsHandover(t *testing.T) {
 	cfg := testConfig(t)
-	yes := []string{"serahin aja ke pak budi", "tolong serahkan ke tim teknis", "delegasikan ke tim build", "jangan lupa ya, serahin ke pak budi"}
+	yes := []string{"serahin aja ke pak budi", "tolong serahkan ke tim teknis", "delegasikan ke tim build", "jangan lupa ya, serahin ke pak budi", "serah ke pak budi dong"}
 	for _, s := range yes {
 		if !cfg.IsHandover(s) {
 			t.Fatalf("IsHandover(%q) = false, mau true", s)
 		}
 	}
-	no := []string{"halo apa kabar", "tolong fix bug ini", "makasih ya", "jangan serahin ke pak budi", "ga usah delegasikan ke tim teknis", "jangan serahin aja tugasnya ke pak budi"}
+	no := []string{
+		"halo apa kabar", "tolong fix bug ini", "makasih ya",
+		// negasi
+		"jangan serahin ke pak budi", "ga usah delegasikan ke tim teknis", "jangan serahin aja tugasnya ke pak budi",
+		// pertanyaan (jangan memicu serah terima baru)
+		"tepi pak budi udah kerja?", "udah kamu serahin ke pak budi?", "tep udah kamu serahin ke pak budi",
+		"pak budi udah kerja", "kamu sudah serahkan ke tim teknis belum?",
+	}
 	for _, s := range no {
 		if cfg.IsHandover(s) {
 			t.Fatalf("IsHandover(%q) = true, mau false", s)
@@ -827,6 +834,48 @@ func TestHandoverKeTimTeknis(t *testing.T) {
 	msgs := sender.messages()
 	if last := msgs[len(msgs)-1]; !strings.Contains(last, "rangkuman selesai untuk bos") {
 		t.Fatalf("balasan akhir = %q, mau rangkuman build", last)
+	}
+}
+
+func TestHandoverTidakKirimAckSusulan(t *testing.T) {
+	cfg := testConfig(t)
+	// Ack delay pendek supaya (kalau bug) ack susulan keburu terkirim saat
+	// build yang lambat masih jalan.
+	cfg.AckDelaySeconds = 1
+	cfg.AckMessages = []string{"lagi diproses"}
+	chatRunner := &seqRunner{outs: []string{
+		`{"type":"text","part":{"text":"spesifikasi tugas"}}`,
+		`{"type":"text","part":{"text":"rangkuman selesai"}}`,
+	}}
+	workRunner := &stubRunner{stdout: `{"type":"text","part":{"text":"build ok"}}`, delay: 1500 * time.Millisecond}
+	sender := &stubSender{}
+	r := newTestRelay(t, cfg, chatRunner, sender)
+	r.SetWorkRunner(workRunner)
+	chat := "6281234567890@s.whatsapp.net"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r.handleMessage(ctx, taskItem{ID: "h1", Text: "serahin aja tugasnya ke pak budi", Lane: LaneChat, Chat: chat})
+
+	deadline := time.After(5 * time.Second)
+	for {
+		msgs := sender.messages()
+		if len(msgs) > 0 && strings.Contains(msgs[len(msgs)-1], "rangkuman selesai") {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("handover tidak selesai: msgs=%v", sender.messages())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	// Beri waktu: kalau scheduler ack keliru menyala, di sini bakal nongol.
+	time.Sleep(500 * time.Millisecond)
+	for _, m := range sender.messages() {
+		if m == "lagi diproses" {
+			t.Fatalf("ack susulan ikut terkirim padahal handover sudah ack: %v", sender.messages())
+		}
 	}
 }
 

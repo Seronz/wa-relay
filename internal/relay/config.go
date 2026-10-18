@@ -76,7 +76,7 @@ type Config struct {
 	// memerintah eksplisit (lihat HandoverKeywords).
 	AutoWorkRouting bool `json:"auto_work_routing"`
 	// HandoverKeywords adalah frasa pemicu serah terima tugas ke tim teknis
-	// (mis. "serahin ke pak budi"). Ditambahkan ke defaultHandoverKeywords.
+	// (mis. "serahin ke pak budi"). Ditambahkan ke defaultHandoverVerbs.
 	HandoverKeywords []string `json:"handover_keywords"`
 	// HandoverAck adalah pesan singkat stepi begitu tugas diserahkan ke tim
 	// teknis. Kosong -> defaultHandoverAck.
@@ -186,8 +186,8 @@ func (c *Config) HeavyPattern() *regexp.Regexp {
 // (default + config) secara lazy dan cache. Cocok frasa dengan word boundary.
 func (c *Config) HandoverPattern() *regexp.Regexp {
 	c.handoverOnce.Do(func() {
-		patterns := make([]string, 0, len(defaultHandoverKeywords)+len(c.HandoverKeywords))
-		for _, k := range append(append([]string{}, defaultHandoverKeywords...), c.HandoverKeywords...) {
+		patterns := make([]string, 0, len(defaultHandoverVerbs)+len(c.HandoverKeywords))
+		for _, k := range append(append([]string{}, defaultHandoverVerbs...), c.HandoverKeywords...) {
 			k = strings.ToLower(strings.TrimSpace(k))
 			if k == "" {
 				continue
@@ -203,12 +203,28 @@ func (c *Config) HandoverPattern() *regexp.Regexp {
 }
 
 // negationRe cocok penanda negasi yang membatalkan perintah serah terima,
-// mis. "jangan serahin ke Pak Budi". Dicek pada klausa sebelum kata kunci.
+// mis. "jangan serahin ke Pak Budi".
 var negationRe = regexp.MustCompile(`(?i)\b(jangan|jgn|janganlah|jangan dulu|gausah|ga usah|nggak usah|nggak|ngga|engga|enggak|gak|ga|tdk|tidak|bukan|belum)\b`)
 
-// IsHandover melaporkan apakah teks berisi perintah serah terima tugas ke tim
-// teknis (mis. "serahin aja ke Pak Budi"). Perintah yang dinegasi dalam klausa
-// yang sama (mis. "jangan serahin ke Pak Budi") dianggap bukan perintah.
+// questionRe cocok kata tanya/penanda pertanyaan yang bikin kalimat bukan
+// perintah, mis. "udah kamu serahin ke pak budi?".
+var questionRe = regexp.MustCompile(`(?i)\b(apakah|apa|udah|sudah|udh|dah|belom|gimana|bagaimana|kapan|siapa|mana|kemana|kok|kenapa|napa|mengapa|berapa|beneran|serius|masa)\b`)
+
+// clauseBefore mengembalikan bagian teks sebelum index pos, dibatasi ke klausa
+// terakhir (setelah tanda baca terakhir). Dipakai untuk memeriksa negasi/kata
+// tanya yang mendahului kata kunci.
+func clauseBefore(text string, pos int) string {
+	clause := text[:pos]
+	if i := strings.LastIndexAny(clause, ".,!?;:"); i >= 0 {
+		clause = clause[i+1:]
+	}
+	return clause
+}
+
+// IsHandover melaporkan apakah teks berisi PERINTAH serah terima tugas ke tim
+// teknis (mis. "serahin aja ke Pak Budi"). Bukan perintah bila dinegasi
+// ("jangan serahin...") atau berupa pertanyaan ("udah kamu serahin...?",
+// "... pak budi udah kerja?"), karena itu cuma obrolan biasa.
 func (c *Config) IsHandover(text string) bool {
 	re := c.HandoverPattern()
 	if re == nil {
@@ -218,14 +234,16 @@ func (c *Config) IsHandover(text string) bool {
 	if loc == nil {
 		return false
 	}
-	// Ambil klausa sebelum kata kunci (batas tanda baca) lalu tolak bila ada
-	// negasi di situ. "jangan lupa ya, serahin ke pak budi" tetap lolos karena
-	// negasi berada di klausa sebelumnya.
-	clause := text[:loc[0]]
-	if i := strings.LastIndexAny(clause, ".,!?;:"); i >= 0 {
-		clause = clause[i+1:]
+	// Pertanyaan eksplisit selalu bukan perintah.
+	if strings.HasSuffix(strings.TrimSpace(text), "?") {
+		return false
 	}
-	return !negationRe.MatchString(clause)
+	// Negasi atau kata tanya di klausa sebelum kata kunci membatalkan perintah.
+	clause := clauseBefore(text, loc[0])
+	if negationRe.MatchString(clause) || questionRe.MatchString(clause) {
+		return false
+	}
+	return true
 }
 
 // HandoverAckMessage mengembalikan pesan ack serah terima: config bila diisi,

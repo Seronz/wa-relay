@@ -47,7 +47,7 @@ func (r *Relay) handleMessage(ctx context.Context, item taskItem) {
 	if confirmationRe.MatchString(item.Text) {
 		if d, ok := r.delegations.Get(item.Chat); ok {
 			r.delegations.Clear(item.Chat)
-			go r.runDelegation(context.WithoutCancel(ctx), item, d)
+			go r.runDelegation(context.WithoutCancel(ctx), item, d, true)
 			r.markRead(item.Chat)
 			r.log.Info("delegation confirmed id=%s delegate_id=%s", item.ID, d.ID)
 			return
@@ -194,7 +194,10 @@ func (r *Relay) runHandover(ctx context.Context, item taskItem) {
 		spec = strings.TrimSpace(item.Text)
 	}
 	d := &Delegation{ID: item.ID, Text: spec, Chat: item.Chat, CreatedAt: time.Now()}
-	r.runDelegation(ctx, item, d)
+	// Ack serah terima sudah dikirim handleHandover, jadi jangan jadwalkan ack
+	// "udah aku baca pesanmu" lagi (dulu ini bikin pesan auto nyusul 5 menit
+	// setelah stepi balas).
+	r.runDelegation(ctx, item, d, false)
 }
 
 // sendBusy meminta stepi mengabari bos bahwa semua slot build sedang terpakai.
@@ -225,7 +228,9 @@ func (r *Relay) sendBusy(ctx context.Context, item taskItem) {
 // runDelegation menjalankan pipeline delegasi di background: agent teknis
 // (build) mengerjakan tugas, lalu stepi merangkum hasilnya untuk bos. Jalankan
 // dalam goroutine sendiri agar chat tidak terblokir sambil build berjalan.
-func (r *Relay) runDelegation(ctx context.Context, item taskItem, d *Delegation) {
+// scheduleAck true menyalakan ack susulan "udah aku baca pesanmu" selama build;
+// jalur serah terima (handover) sudah mengirim ack sendiri jadi harus false.
+func (r *Relay) runDelegation(ctx context.Context, item taskItem, d *Delegation, scheduleAck bool) {
 	// Pesan satu slot build. Bila dua-duanya sudah terpakai, jangan antre diam:
 	// kabari bos lewat stepi bahwa tim lagi sibuk semua.
 	buildRunner, releaseBuild, ok := r.acquireWork()
@@ -236,16 +241,18 @@ func (r *Relay) runDelegation(ctx context.Context, item taskItem, d *Delegation)
 	}
 	defer releaseBuild()
 
-	schedCtx, stopSchedule := context.WithCancel(context.WithoutCancel(ctx))
-	scheduleDone := make(chan struct{})
-	go func() {
-		defer close(scheduleDone)
-		r.sendScheduled(schedCtx, item)
-	}()
-	defer func() {
-		stopSchedule()
-		<-scheduleDone
-	}()
+	if scheduleAck {
+		schedCtx, stopSchedule := context.WithCancel(context.WithoutCancel(ctx))
+		scheduleDone := make(chan struct{})
+		go func() {
+			defer close(scheduleDone)
+			r.sendScheduled(schedCtx, item)
+		}()
+		defer func() {
+			stopSchedule()
+			<-scheduleDone
+		}()
+	}
 
 	// 1. Agent teknis mengerjakan tugas (slot + sesi work terpisah).
 	buildID := r.beginSession(LaneWork, time.Now())

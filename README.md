@@ -29,8 +29,11 @@ Secara default **semua** pesan ditangani stepi (lane chat) dan stepi **tidak** m
 teknis sendiri. Kalau bos memerintah, stepi menyerahkannya ke tim teknis (agent `work_agent`,
 default `build`):
 
-- Pemicu default (bisa ditambah lewat `handover_keywords`): frasa seperti `serahin`, `serahkan`,
-  `pak budi`, `tim teknis`. Contoh: *"serahin aja tugasnya ke Pak Budi"*.
+- Pemicu default (bisa ditambah lewat `handover_keywords`): kata kerja serah terima seperti `serahin`,
+  `serahkan`, `serah`, `limpahin`, `delegasikan` — bukan sekadar menyebut nama target. Contoh:
+  *"serahin aja tugasnya ke Pak Budi"*. Kalimat yang dinegasi (`jangan serahin...`) atau berupa
+  pertanyaan (`udah kamu serahin ke pak budi?`, `pak budi udah kerja?`) **tidak** memicu serah terima
+  baru — cuma dijawab stepi sebagai obrolan biasa.
 - Stepi menyusun **spesifikasi tugas dari konteks obrolan** (jadi bisa menyerahkan tugas yang
   disebut di pesan sebelumnya), mengirim ack singkat (`handover_ack`), lalu build dijalankan di
   latar belakang (lane work, workdir `work_workdirs`) dan hasilnya dirangkum stepi untuk bos.

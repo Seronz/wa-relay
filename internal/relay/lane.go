@@ -42,13 +42,15 @@ var defaultHeavyKeywords = []string{
 	"readme", "dokumentasi", "issue", "relay", "webhook",
 }
 
-// defaultHandoverKeywords adalah frasa pemicu serah terima tugas ke tim teknis.
-// Dipakai saat bos memerintah stepi secara eksplisit (stepi sebagai
-// resepsionis), mis. "serahin aja tugasnya ke Pak Budi". Perilaku ini terpisah
-// dari routing otomatis (AutoWorkRouting).
-var defaultHandoverKeywords = []string{
-	"serahin", "serahkan", "serahin aja", "serah aja", "limpahkan", "limpahin",
-	"delegasikan", "delegasiin", "pak budi", "pakbudi", "tim teknis", "tim build",
+// defaultHandoverVerbs adalah kata kerja imperatif pemicu serah terima tugas
+// ke tim teknis (stepi sebagai resepsionis), mis. "serahin aja tugasnya ke Pak
+// Budi". Hanya kata kerja ini (plus handover_keywords dari config) yang
+// memicu; nama target seperti "pak budi"/"tim teknis" BUKAN pemicu sendiri,
+// supaya pertanyaan macam "pak budi udah kerja?" tidak ikut tertangkap.
+// Perilaku ini terpisah dari routing otomatis (AutoWorkRouting).
+var defaultHandoverVerbs = []string{
+	"serahin", "serahkan", "serah", "limpahkan", "limpahin",
+	"delegasikan", "delegasiin", "handover",
 }
 
 // Classify menentukan lane sebuah pesan. Secara default semuanya masuk lane
