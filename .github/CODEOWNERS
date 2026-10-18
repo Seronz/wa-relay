@@ -1,0 +1,3 @@
+# Reviewer otomatis: setiap PR wajib minta review dari owner repo.
+# Bikin GitHub otomatis nge-request @Seronz sebagai reviewer di semua PR.
+* @Seronz
