@@ -771,13 +771,13 @@ func TestClassifyRoutingToggle(t *testing.T) {
 
 func TestIsHandover(t *testing.T) {
 	cfg := testConfig(t)
-	yes := []string{"serahin aja ke pak budi", "tolong serahkan ke tim teknis", "delegasikan ke tim build"}
+	yes := []string{"serahin aja ke pak budi", "tolong serahkan ke tim teknis", "delegasikan ke tim build", "jangan lupa ya, serahin ke pak budi"}
 	for _, s := range yes {
 		if !cfg.IsHandover(s) {
 			t.Fatalf("IsHandover(%q) = false, mau true", s)
 		}
 	}
-	no := []string{"halo apa kabar", "tolong fix bug ini", "makasih ya"}
+	no := []string{"halo apa kabar", "tolong fix bug ini", "makasih ya", "jangan serahin ke pak budi", "ga usah delegasikan ke tim teknis", "jangan serahin aja tugasnya ke pak budi"}
 	for _, s := range no {
 		if cfg.IsHandover(s) {
 			t.Fatalf("IsHandover(%q) = true, mau false", s)

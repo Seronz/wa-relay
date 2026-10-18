@@ -202,11 +202,30 @@ func (c *Config) HandoverPattern() *regexp.Regexp {
 	return c.handoverRe
 }
 
+// negationRe cocok penanda negasi yang membatalkan perintah serah terima,
+// mis. "jangan serahin ke Pak Budi". Dicek pada klausa sebelum kata kunci.
+var negationRe = regexp.MustCompile(`(?i)\b(jangan|jgn|janganlah|jangan dulu|gausah|ga usah|nggak usah|nggak|ngga|engga|enggak|gak|ga|tdk|tidak|bukan|belum)\b`)
+
 // IsHandover melaporkan apakah teks berisi perintah serah terima tugas ke tim
-// teknis (mis. "serahin aja ke Pak Budi").
+// teknis (mis. "serahin aja ke Pak Budi"). Perintah yang dinegasi dalam klausa
+// yang sama (mis. "jangan serahin ke Pak Budi") dianggap bukan perintah.
 func (c *Config) IsHandover(text string) bool {
 	re := c.HandoverPattern()
-	return re != nil && re.MatchString(text)
+	if re == nil {
+		return false
+	}
+	loc := re.FindStringIndex(text)
+	if loc == nil {
+		return false
+	}
+	// Ambil klausa sebelum kata kunci (batas tanda baca) lalu tolak bila ada
+	// negasi di situ. "jangan lupa ya, serahin ke pak budi" tetap lolos karena
+	// negasi berada di klausa sebelumnya.
+	clause := text[:loc[0]]
+	if i := strings.LastIndexAny(clause, ".,!?;:"); i >= 0 {
+		clause = clause[i+1:]
+	}
+	return !negationRe.MatchString(clause)
 }
 
 // HandoverAckMessage mengembalikan pesan ack serah terima: config bila diisi,
