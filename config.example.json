@@ -44,6 +44,7 @@
   "opencode_bin": "opencode",
   "wacli_bin": "wacli",
   "num_workers": 3,
+  "chat_workers": 1,
   "timeout_seconds": 900,
   "mark_read": true,
   "send_file_enabled": true,

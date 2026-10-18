@@ -103,6 +103,7 @@ Relay tidak pernah mengirim lampiran kecuali agent memintanya, jadi chat teks bi
 | `ack_followups` | Array `{after_seconds, messages}`, pesan susulan bila task belum selesai (default 600s) |
 | `opencode_bin` / `wacli_bin` | Path binary |
 | `num_workers` | Jumlah worker paralel yang menguras antrean (default 3) |
+| `chat_workers` | Jumlah worker khusus lane chat (pesan ringan stepi), terpisah dari lane work (default 1) |
 | `timeout_seconds` | Timeout `opencode run` (default 900) |
 | `mark_read` | Tandai pesan owner sebagai sudah dibaca / kirim read receipt lewat `wacli chats mark-read --receipts` (default `true`); dikirim tepat sebelum balasan final, bukan saat pesan masuk |
 | `send_file_enabled` | Izinkan relay mengirim file/foto ke WA saat agent menyelipkan directive lampiran (default `true`) |
